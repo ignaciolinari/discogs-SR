@@ -21,8 +21,8 @@ DATABASE_PATH = None
 con = None
 cursor = None
 
-DISCOVERY_MAX_DEPTH = 2
-MAX_LISTS_PER_USER = 3
+DISCOVERY_MAX_DEPTH = 3
+MAX_LISTS_PER_USER = 5
 POPULAR_USERS = [
     "rodneyfool",
     "stuporfly",

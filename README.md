@@ -1,6 +1,6 @@
 # Discogs Recommender
 
-Sistema experimental para recolectar datos públicos de la API de Discogs y generar recomendaciones básicas de discos.
+Sistema experimental para recolectar datos públicos de la API de Discogs y generar recomendaciones de discos. El catálogo completo de Discogs supera los ~16 millones de lanzamientos y ~8 millones de usuarios; este proyecto se enfoca en explorar una fracción  de ese universo.
 
 ## Características
 

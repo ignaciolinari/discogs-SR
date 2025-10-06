@@ -61,7 +61,7 @@ def get_seed_username(default: str = "Xmipod") -> str:
     return os.getenv("DISCOGS_SEED_USERNAME", default)
 
 
-def get_api_pause(default: int = 2) -> int:
+def get_api_pause(default: int = 1) -> int:
     """Return default pause between API calls in seconds."""
 
     env_value = os.getenv("DISCOGS_API_PAUSE")
