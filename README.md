@@ -45,6 +45,13 @@ Para los hooks de desarrollo: `pip install pre-commit black isort flake8 flake8-
 
 ## Configuración
 
+Las rutas a la base y el token se resuelven vía `settings.py`. Todos los componentes usan `get_database_path()` para abrir el mismo archivo SQLite. Si no exportás `DATABASE_PATH`, se crea `data/discogs.db` automáticamente.
+
+```bash
+export DISCOGS_TOKEN="tu_token"
+export DATABASE_PATH="/ruta/absoluta/a/discogs.db"  # opcional
+```
+
 Las variables se leen del entorno (no se usa `.env`). Ejemplo con conda:
 
 ```bash
@@ -63,7 +70,16 @@ Variables relevantes:
 
 ## Poblar la base
 
-### Colecciones puntuales
+### Scripts disponibles
+
+| Script | Uso principal | Qué ingesta | Cuándo usarlo |
+|--------|---------------|-------------|----------------|
+| `fill_db_discogs_API.py` | CLI liviano | Solo colección (folder 0) de usuarios puntuales | Poblar rápido perfiles para demo o debugging |
+| `fill_db_recommendation_system.py` | Crawler completo | Colección, wantlist, contribuciones + descubrimiento BFS | Correr sesiones largas, nutrir el dataset para recomendaciones |
+
+Ambos scripts escriben en la misma base configurada por `get_database_path()`.
+
+### Colecciones puntuales (script simple)
 
 ```bash
 python fill_db_discogs_API.py --user Xmipod          # un usuario
@@ -72,21 +88,56 @@ python fill_db_discogs_API.py --users-file usuarios.txt --delay 2
 
 El archivo `usuarios.txt` debe contener un username por línea.
 
-### Modo completo para el sistema de recomendaciones
+### Modo completo para el sistema de recomendaciones (crawler)
 
 ```bash
 python fill_db_recommendation_system.py \
   --seed Xmipod \
   --max-users 5 \
-  --api-pause 3
+  --api-pause 1
 ```
 
 Parámetros útiles:
 
 - `--token`: token alternativo (sobre-escribe la variable de entorno).
-- `--force`: reprocesa usuarios aunque ya tengan datos.
+- `--force`: reprocesa usuarios aunque ya tengan datos (actualiza interacciones existentes).
+- `--min-items`: salta usuarios con pocas interacciones previas.
 - `--continue-from`: retoma desde un usuario guardado en `.last_processed_user.txt` (auto generado si se interrumpe el proceso).
 - `--adaptive-pause`: activa pausas adaptativas según headers de rate limit.
+- `--max-users`: controla cuántos usuarios descubre/procesa a partir del seed.
+
+#### ¿Cómo descubre nuevos usuarios?
+
+La API de Discogs **no expone** quién más tiene/quiere un release, por lo que no podemos saltar automáticamente de un disco a otro usuario. El crawler usa lo que sí está disponible:
+
+- followers y following del seed (hasta `DISCOVERY_MAX_DEPTH`, por defecto 2 niveles).
+- contribuyentes de listas públicas del usuario.
+- un pool de seeds adicionales (`--extra-seeds` / `--seeds-file`) para seguir explorando cuando la vecindad se agota.
+
+Cada usuario visitado queda registrado en `.discovered_users.log` para evitar reprocesarlos en corridas futuras (borrá ese archivo si querés reiniciar la exploración). Si Discogs agrega endpoints con colección compartida por release, se puede extender la estrategia fácilmente.
+
+#### Ejecución prolongada
+
+Para dejarlo corriendo varias horas con logging:
+
+```bash
+mkdir -p logs
+export DISCOGS_TOKEN="tu_token"
+nohup python fill_db_recommendation_system.py \
+  --seed Xmipod \
+  --max-users 50 \
+  --force \
+  --min-items 30 \
+  --api-pause 1 \
+  --adaptive-pause \
+  > logs/recommendation_ingest.log 2>&1 &
+```
+
+- Revisá el progreso con `tail -f logs/recommendation_ingest.log`.
+- Interrumpí con `Ctrl+C` si está en primer plano. En background: `pkill -f fill_db_recommendation_system.py` (macOS/Linux).
+- El archivo `.last_processed_user.txt` permite retomar con `--continue-from`.
+
+Para correr en primer plano (sin `nohup` ni background) simplemente omite `nohup` y el `&` final.
 
 ## Ejecutar la app web
 
@@ -126,12 +177,22 @@ date_added TEXT
 
 ## Buenas prácticas
 
-- Corré `pre-commit run --all-files` antes del primer commit.
-- No compartas `discogs.db` ni tu token; ambos están ignorados por git.
-- Usa ramas feature + PRs para cambios grandes.
+- Correr `pre-commit run --all-files` antes del primer commit.
+- No compartir `discogs.db` ni tu token; ambos están ignorados por git.
 
 ## Próximos pasos
 
 - Mejorar algoritmos de recomendación (filtrado colaborativo, contenido, etc.).
 - Crear tests automáticos para los scripts de ingesta y web.
 - Agregar dashboards simples para monitorear cobertura de datos.
+
+## Pruebas
+
+Las utilidades de discovery incluyen un harness básico:
+
+```bash
+export DISCOGS_TOKEN="tu_token"
+python -c "import fill_db_recommendation_system as m; m.init_runtime(); m.run_tests()"
+```
+
+Esto valida los mocks de `get_user_neighbors` y `discover_users`. Podés pasar el token directo: `m.init_runtime(token="tu_token")` si preferís no exportarlo.

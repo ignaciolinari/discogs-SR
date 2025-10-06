@@ -1,7 +1,9 @@
 import os
 import sqlite3
 import time
+from collections import deque
 from datetime import datetime
+from pathlib import Path
 
 import requests
 
@@ -13,18 +15,298 @@ from settings import (
 )
 
 BASE_URL = "https://api.discogs.com"
+DISCOGS_TOKEN = None
+DEFAULT_SEED_USERNAME = None
+DATABASE_PATH = None
+con = None
+cursor = None
 
-try:
-    DISCOGS_TOKEN = get_discogs_token()
-except RuntimeError as err:
-    raise SystemExit(err)
+DISCOVERY_MAX_DEPTH = 2
+MAX_LISTS_PER_USER = 3
+POPULAR_USERS = [
+    "rodneyfool",
+    "stuporfly",
+    "machine_funk",
+    "boogiedowns",
+    "rasputin",
+    "discogscollector",
+    "VinylVixen",
+    "JazzMaster",
+    "RockEnthusiast",
+]
+VISITED_USERS_FILE = Path(".discovered_users.log")
+DISCOVERY_PAUSE = 1.0
 
-DEFAULT_SEED_USERNAME = get_seed_username()
-DATABASE_PATH = get_database_path()
 
-# Conexión DB
-con = sqlite3.connect(str(DATABASE_PATH))
-cursor = con.cursor()
+def init_runtime(token=None):
+    global DISCOGS_TOKEN, DEFAULT_SEED_USERNAME, DATABASE_PATH, con, cursor
+    if DISCOGS_TOKEN is not None and con is not None:
+        return
+
+    DISCOGS_TOKEN = token or get_discogs_token()
+    DEFAULT_SEED_USERNAME = get_seed_username()
+    DATABASE_PATH = get_database_path()
+    con = sqlite3.connect(str(DATABASE_PATH))
+    cursor = con.cursor()
+
+
+def _mock_api_response(status_code=200, json_data=None):
+    class MockResponse:
+        def __init__(self, code, payload):
+            self.status_code = code
+            self._payload = payload or {}
+            self.headers = {}
+
+        def json(self):
+            return self._payload
+
+        @property
+        def text(self):
+            return "" if self._payload is None else "x"
+
+    return MockResponse(status_code, json_data)
+
+
+def _test_get_user_neighbors():
+    original_api_call = globals()["api_call"]
+
+    def fake_api_call(url, params):
+        if url.endswith("/following"):
+            return _mock_api_response(
+                json_data={"following": [{"username": "alice"}, {"username": "bob"}]}
+            )
+        if url.endswith("/followers"):
+            return _mock_api_response(
+                json_data={"followers": [{"username": "carol"}, {"username": "dave"}]}
+            )
+        if "/lists" in url:
+            return _mock_api_response(
+                json_data={
+                    "lists": [
+                        {"resource_url": "mock://list/1", "name": "List 1"},
+                    ]
+                }
+            )
+        if url.startswith("mock://list/1"):
+            return _mock_api_response(
+                json_data={
+                    "contributors": [
+                        {"username": "eve"},
+                        {"username": "frank"},
+                    ]
+                }
+            )
+        return _mock_api_response()
+
+    globals()["api_call"] = fake_api_call
+
+    neighbors = get_user_neighbors("seed", remaining=4)
+    assert neighbors == ["alice", "bob", "carol", "dave"], neighbors
+
+    neighbors = get_user_neighbors("seed", remaining=6)
+    assert neighbors == ["alice", "bob", "carol", "dave", "eve", "frank"], neighbors
+
+    globals()["api_call"] = original_api_call
+
+
+def _test_discover_users():
+    original_api_call = globals()["api_call"]
+    original_load = globals()["load_visited_users"]
+    original_persist = globals()["persist_visited_users"]
+
+    def fake_api_call(url, params):
+        if url.endswith("/following"):
+            return _mock_api_response(
+                json_data={"following": [{"username": "u1"}, {"username": "u2"}]}
+            )
+        if url.endswith("/followers"):
+            return _mock_api_response(json_data={"followers": [{"username": "u3"}]})
+        return _mock_api_response(json_data={"lists": []})
+
+    def fake_load():
+        return set()
+
+    captured = {}
+
+    def fake_persist(visited):
+        captured["visited"] = set(visited)
+
+    globals()["api_call"] = fake_api_call
+    globals()["load_visited_users"] = fake_load
+    globals()["persist_visited_users"] = fake_persist
+
+    users = discover_users("seed", max_users=4, depth=1)
+    assert users[0] == "seed"
+    assert set(users[1:]) <= {"u1", "u2", "u3"}
+    assert "seed" in captured.get("visited", set())
+
+    globals()["api_call"] = original_api_call
+    globals()["load_visited_users"] = original_load
+    globals()["persist_visited_users"] = original_persist
+
+
+def run_tests():
+    init_runtime(token="test-token")
+    print("Ejecutando tests de discovery...")
+    _test_get_user_neighbors()
+    print("- get_user_neighbors OK")
+    _test_discover_users()
+    print("- discover_users OK")
+    print("Todos los tests pasaron correctamente.")
+
+
+def load_visited_users():
+    if not VISITED_USERS_FILE.exists():
+        return set()
+    try:
+        with VISITED_USERS_FILE.open("r", encoding="utf-8") as fh:
+            return {line.strip().lower() for line in fh if line.strip()}
+    except OSError:
+        return set()
+
+
+def persist_visited_users(visited):
+    try:
+        with VISITED_USERS_FILE.open("w", encoding="utf-8") as fh:
+            for username in sorted(visited):
+                fh.write(f"{username}\n")
+    except OSError as exc:
+        print(f"No se pudo guardar el cache de usuarios visitados: {exc}")
+
+
+# Variables globales para control de skipping
+FORCE_UPDATE = False
+MIN_ITEMS_THRESHOLD = 50
+API_PAUSE = get_api_pause()  # Pausa entre llamadas API en segundos
+MAX_RATE_LIMIT_RETRIES = (
+    5  # Número de intentos si se alcanza el límite de tasa (aumentado)
+)
+RATE_LIMIT_COOLDOWN = (
+    60  # Tiempo de espera en segundos cuando se alcanza el límite de tasa (aumentado)
+)
+API_ADAPTIVE_PAUSE = False  # Pausas adaptativas basadas en la carga del servidor
+
+# Contadores globales para monitorear uso de la API
+API_CALLS_COUNT = 0
+RATE_LIMIT_HITS = 0
+LAST_API_CALL_TIME = None
+
+
+def calculate_dynamic_pause(remaining=None, reset_time=None):
+    """Calcula una pausa dinámica basada en el estado de límite de tasa"""
+    global API_CALLS_COUNT, LAST_API_CALL_TIME
+
+    # Pausa base
+    pause = API_PAUSE
+
+    # Si la pausa adaptativa está activada y tenemos información de límites
+    if API_ADAPTIVE_PAUSE and remaining is not None:
+        try:
+            remaining = int(remaining)
+
+            # Ajustar la pausa de forma inversamente proporcional a las llamadas restantes
+            if remaining <= 10:
+                pause = max(
+                    10, API_PAUSE * 3
+                )  # Pausa extendida cuando quedan pocas llamadas
+            elif remaining <= 20:
+                pause = max(5, API_PAUSE * 2)  # Pausa moderada
+
+            # Si además tenemos información del tiempo de reinicio
+            if reset_time and reset_time.isdigit():
+                reset_seconds = int(reset_time)
+                if reset_seconds < 60:  # Si estamos cerca del reinicio del contador
+                    pause = max(
+                        pause, reset_seconds / 2
+                    )  # Esperar una parte del tiempo hasta el reinicio
+
+        except (ValueError, TypeError):
+            pass  # Si hay error en la conversión, usar la pausa base
+
+    # Pausa preventiva periódica
+    if API_CALLS_COUNT > 0 and API_CALLS_COUNT % 40 == 0:
+        pause = max(pause, 15)  # Pausa extendida cada 40 llamadas
+
+    return pause
+
+
+def api_call(url, params):
+    """Realiza una llamada a la API con manejo automático de límites de tasa"""
+    global API_CALLS_COUNT, RATE_LIMIT_HITS, LAST_API_CALL_TIME
+
+    # Verificar si estamos haciendo demasiadas llamadas en poco tiempo
+    if API_CALLS_COUNT > 0 and API_CALLS_COUNT % 50 == 0:
+        print(f"Pausa preventiva después de {API_CALLS_COUNT} llamadas a la API...")
+        time.sleep(30)  # Pausa preventiva cada 50 llamadas
+
+    # Si es la primera llamada, no hay espera inicial
+    if LAST_API_CALL_TIME is not None:
+        # Calcular tiempo transcurrido desde la última llamada
+        elapsed = time.time() - LAST_API_CALL_TIME
+
+        # Si no ha pasado suficiente tiempo, esperar
+        if elapsed < API_PAUSE:
+            time.sleep(API_PAUSE - elapsed)
+
+    retries = 0
+    while retries <= MAX_RATE_LIMIT_RETRIES:
+        try:
+            # Actualizar tiempo de la última llamada
+            LAST_API_CALL_TIME = time.time()
+
+            # Incrementar contador de llamadas
+            API_CALLS_COUNT += 1
+
+            # Realizar la llamada a la API
+            r = requests.get(url, params=params, timeout=30)
+
+            # Verificar headers relacionados con límites de tasa si están disponibles
+            remaining = r.headers.get("X-Discogs-Ratelimit-Remaining")
+            reset_time = r.headers.get("X-Discogs-Ratelimit-Reset")
+
+            # Mostrar información de límites si está disponible
+            if remaining:
+                if int(remaining) < 10:
+                    print(
+                        f"¡Advertencia! Solo quedan {remaining} solicitudes disponibles."
+                    )
+
+                    if reset_time:
+                        print("Límite se reiniciará en {} segundos.".format(reset_time))
+
+            # Determinar pausa dinámica basada en el estado de límites
+            dynamic_pause = calculate_dynamic_pause(remaining, reset_time)
+
+            # Manejar límites de tasa
+            if r.status_code == 429:  # Código de límite de tasa excedido
+                RATE_LIMIT_HITS += 1
+                retries += 1
+
+                if retries <= MAX_RATE_LIMIT_RETRIES:
+                    # Aumentar el tiempo de espera exponencialmente con cada reintento
+                    wait_time = RATE_LIMIT_COOLDOWN * (2 ** (retries - 1))
+                    print(
+                        "Límite de tasa alcanzado ({}). Esperando {} segundos "
+                        "antes de reintentar...".format(
+                            RATE_LIMIT_HITS,
+                            wait_time,
+                        )
+                    )
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    print("Máximo de reintentos alcanzado. Cancelando solicitud.")
+                    return None
+
+            # Si es exitoso, esperar un tiempo dinámico para no sobrecargar la API
+            time.sleep(dynamic_pause)
+            return r
+
+        except requests.exceptions.RequestException as e:
+            print(f"Error de conexión: {e}")
+            return None
+
+    return None
 
 
 def get_user_info(username):
@@ -94,9 +376,6 @@ def item_exists(item_id):
 
 def interaction_exists(user_id, item_id, interaction_type):
     """Verifica si una interacción específica ya existe en la base de datos"""
-    # Si estamos en modo forzado, siempre retornamos False para procesar todo
-    if FORCE_UPDATE:
-        return False
 
     cursor.execute(
         """
@@ -129,8 +408,16 @@ def insert_item(item_id, title, artist, year, genre, style, image_url):
 
 
 def insert_interaction(user_id, item_id, interaction_type, rating, date_added):
-    # Evitamos duplicar interacciones
-    if not interaction_exists(user_id, item_id, interaction_type):
+    if interaction_exists(user_id, item_id, interaction_type):
+        cursor.execute(
+            """
+        UPDATE interactions
+        SET rating = ?, date_added = ?
+        WHERE user_id = ? AND item_id = ? AND interaction_type = ?
+        """,
+            (rating, date_added, user_id, item_id, interaction_type),
+        )
+    else:
         cursor.execute(
             """
         INSERT INTO interactions (user_id, item_id, interaction_type, rating, date_added)
@@ -515,138 +802,166 @@ def get_user_submissions(username, limit=20):
 
 
 # Función para descubrir usuarios relacionados
-def discover_users(seed_username, max_users=5):
-    """
-    Descubre usuarios relacionados con colecciones públicas basados en un usuario semilla
-    Utiliza diversas estrategias para encontrar usuarios con gustos similares
-    """
-    discovered_users = [seed_username]
-    processed_users = set(discovered_users)
 
-    # Método 1: Usuarios seguidos por el usuario semilla
-    url = f"{BASE_URL}/users/{seed_username}/following"
-    params = {"token": DISCOGS_TOKEN, "per_page": max_users}
+
+def safe_api_json(url, params=None, context=""):
+    params = dict(params or {})
+    if "token" not in params:
+        params["token"] = DISCOGS_TOKEN
 
     try:
-        # Usar función de API con manejo de límites de tasa
-        r = api_call(url, params)
-
-        if r and r.status_code == 200:
-            data = r.json()
-            for user in data.get("following", []):
-                if (
-                    len(discovered_users) < max_users
-                    and user["username"] not in processed_users
-                ):
-                    discovered_users.append(user["username"])
-                    processed_users.add(user["username"])
-    except Exception as e:
-        print(f"Error buscando usuarios seguidos: {e}")
-
-    # Método 2: Usuarios que siguen al usuario semilla
-    if len(discovered_users) < max_users:
-        url = f"{BASE_URL}/users/{seed_username}/followers"
-        try:
-            # Usar función de API con manejo de límites de tasa
-            r = api_call(url, params)
-
-            if r and r.status_code == 200:
-                data = r.json()
-                for user in data.get("followers", []):
-                    if (
-                        len(discovered_users) < max_users
-                        and user["username"] not in processed_users
-                    ):
-                        discovered_users.append(user["username"])
-                        processed_users.add(user["username"])
-        except Exception as e:
-            print(f"Error buscando seguidores: {e}")
-
-    # Método 3: Usuarios con items en común en su colección
-    if len(discovered_users) < max_users:
-        try:
-            # Obtener unos pocos items de la colección del usuario semilla
-            collection_url = (
-                f"{BASE_URL}/users/{seed_username}/collection/folders/0/releases"
+        response = api_call(url, params)
+        if response and response.status_code == 200:
+            return response.json()
+        if response and response.status_code != 200 and context:
+            print(
+                f"No se pudo obtener datos de {context} (status {response.status_code})."
             )
-            r = requests.get(
-                collection_url, params={"token": DISCOGS_TOKEN, "per_page": 5}
-            )
-            if r.status_code == 200:
-                for release in r.json().get("releases", []):
-                    # Para cada release, buscar quién más lo tiene en su colección
-                    release_id = release["id"]
-                    release_url = f"{BASE_URL}/marketplace/stats/{release_id}"
-                    r2 = requests.get(release_url, params={"token": DISCOGS_TOKEN})
+    except Exception as exc:
+        if context:
+            print(f"Error obteniendo datos de {context}: {exc}")
+    return None
 
-                    if r2.status_code == 200 and len(discovered_users) < max_users:
-                        # Aquí podríamos obtener usuarios que también tienen este disco, pero
-                        # la API de Discogs no ofrece directamente esta información
-                        # Usaremos una búsqueda alternativa en la próxima estrategia
-                        pass
-                    time.sleep(1)  # Pausar para no exceder límites API
-        except Exception as e:
-            print(f"Error buscando por colecciones en común: {e}")
 
-    # Método 4: Búsqueda por listas compartidas
-    if len(discovered_users) < max_users:
-        try:
-            url = f"{BASE_URL}/users/{seed_username}/lists"
-            r = requests.get(url, params={"token": DISCOGS_TOKEN})
-            if r.status_code == 200:
-                data = r.json()
-                for list_item in data.get("lists", []):
-                    if len(discovered_users) >= max_users:
-                        break
+def get_user_neighbors(username, remaining):
+    if remaining <= 0:
+        return []
 
-                    list_url = list_item.get("resource_url")
-                    if list_url:
-                        r2 = requests.get(list_url, params={"token": DISCOGS_TOKEN})
-                        if r2.status_code == 200:
-                            # Buscar contribuidores en la lista
-                            for user_info in r2.json().get("contributors", []):
-                                if (
-                                    isinstance(user_info, dict)
-                                    and "username" in user_info
-                                ):
-                                    username = user_info["username"]
-                                    if (
-                                        username not in processed_users
-                                        and len(discovered_users) < max_users
-                                    ):
-                                        discovered_users.append(username)
-                                        processed_users.add(username)
-        except Exception as e:
-            print(f"Error buscando en listas compartidas: {e}")
+    neighbors = []
+    seen = set()
+    username_lower = username.lower()
 
-    # Método 5: Si no encontramos suficientes, usar usuarios populares
-    if len(discovered_users) < max_users:
-        popular_users = [
-            "rodneyfool",
-            "stuporfly",
-            "machine_funk",
-            "boogiedowns",
-            "rasputin",
-            "discogscollector",
-            "VinylVixen",
-            "JazzMaster",
-            "RockEnthusiast",
-        ]
+    def add_candidate(candidate):
+        if not candidate:
+            return False
+        candidate = candidate.strip()
+        if not candidate:
+            return False
+        candidate_lower = candidate.lower()
+        if candidate_lower == username_lower:
+            return False
+        if candidate_lower in seen:
+            return False
+        seen.add(candidate_lower)
+        neighbors.append(candidate)
+        return True
 
-        for user in popular_users:
-            if user not in processed_users and len(discovered_users) < max_users:
-                # Verificar que el usuario existe y tiene colección pública
-                verify_url = f"{BASE_URL}/users/{user}"
-                try:
-                    r = requests.get(verify_url, params={"token": DISCOGS_TOKEN})
-                    if r.status_code == 200:
-                        discovered_users.append(user)
-                        processed_users.add(user)
-                except requests.RequestException:
+    per_page = min(max(remaining, 1), 50)
+
+    for endpoint in ("following", "followers"):
+        if len(neighbors) >= remaining:
+            break
+        data = safe_api_json(
+            f"{BASE_URL}/users/{username}/{endpoint}",
+            {"per_page": per_page},
+            context=f"{endpoint} de {username}",
+        )
+        if not data:
+            continue
+        for user in data.get(endpoint, []):
+            if len(neighbors) >= remaining:
+                break
+            add_candidate(user.get("username"))
+        time.sleep(DISCOVERY_PAUSE)
+
+    if len(neighbors) < remaining:
+        lists_data = safe_api_json(
+            f"{BASE_URL}/users/{username}/lists",
+            {"per_page": MAX_LISTS_PER_USER},
+            context=f"listas de {username}",
+        )
+        if lists_data:
+            for list_item in lists_data.get("lists", [])[:MAX_LISTS_PER_USER]:
+                if len(neighbors) >= remaining:
+                    break
+                list_url = list_item.get("resource_url")
+                if not list_url:
                     continue
+                list_data = safe_api_json(
+                    list_url,
+                    {"per_page": 50},
+                    context=f"lista {list_item.get('name', '')} de {username}",
+                )
+                if not list_data:
+                    continue
+                for contributor in list_data.get("contributors", []):
+                    if len(neighbors) >= remaining:
+                        break
+                    if isinstance(contributor, dict):
+                        candidate = contributor.get("username")
+                    else:
+                        candidate = contributor
+                    add_candidate(candidate)
+                time.sleep(DISCOVERY_PAUSE)
 
-    print(f"Usuarios descubiertos: {discovered_users}")
-    return discovered_users
+    return neighbors[:remaining]
+
+
+def discover_users(
+    seed_username,
+    max_users=5,
+    depth=DISCOVERY_MAX_DEPTH,
+    extra_seeds=None,
+):
+    visited = set(load_visited_users())
+    result = []
+    extra_queue = deque([s.strip() for s in extra_seeds or [] if s.strip()])
+
+    def bfs_from_seed(start_username):
+        if len(result) >= max_users:
+            return
+        queue = deque([(start_username, 0)])
+
+        while queue and len(result) < max_users:
+            username, level = queue.popleft()
+            if not username:
+                continue
+            username_clean = username.strip()
+            if not username_clean:
+                continue
+            username_lower = username_clean.lower()
+            if username_lower in visited:
+                continue
+            visited.add(username_lower)
+            result.append(username_clean)
+
+            if len(result) >= max_users:
+                break
+
+            if level >= depth:
+                continue
+
+            remaining = max(max_users - len(result), 0)
+            neighbors = get_user_neighbors(username_clean, remaining)
+            for neighbor in neighbors:
+                if neighbor:
+                    queue.append((neighbor, level + 1))
+            time.sleep(DISCOVERY_PAUSE)
+
+    bfs_from_seed(seed_username)
+
+    while len(result) < max_users and extra_queue:
+        next_seed = extra_queue.popleft()
+        if not next_seed:
+            continue
+        if next_seed.lower() in visited:
+            continue
+        print(f"Explorando seed adicional: {next_seed}")
+        bfs_from_seed(next_seed)
+
+    if len(result) < max_users:
+        for fallback in POPULAR_USERS:
+            fallback_lower = fallback.lower()
+            if fallback_lower in visited:
+                continue
+            visited.add(fallback_lower)
+            result.append(fallback)
+            if len(result) >= max_users:
+                break
+
+    persist_visited_users(visited)
+    print(f"Usuarios descubiertos: {result}")
+    return result
 
 
 # Función principal para poblar la base de datos
@@ -657,6 +972,7 @@ def count_user_data(user_id):
 
 
 def populate_recommendation_system(seed_username="Xmipod", max_users=5):
+    init_runtime()
     print("Iniciando población de base de datos para sistema de recomendación...")
 
     # Descubrir usuarios automáticamente
@@ -720,125 +1036,9 @@ RATE_LIMIT_HITS = 0
 LAST_API_CALL_TIME = None
 
 
-def calculate_dynamic_pause(remaining=None, reset_time=None):
-    """Calcula una pausa dinámica basada en el estado de límite de tasa"""
-    global API_CALLS_COUNT, LAST_API_CALL_TIME
-
-    # Pausa base
-    pause = API_PAUSE
-
-    # Si la pausa adaptativa está activada y tenemos información de límites
-    if API_ADAPTIVE_PAUSE and remaining is not None:
-        try:
-            remaining = int(remaining)
-
-            # Ajustar la pausa de forma inversamente proporcional a las llamadas restantes
-            if remaining <= 10:
-                pause = max(
-                    10, API_PAUSE * 3
-                )  # Pausa extendida cuando quedan pocas llamadas
-            elif remaining <= 20:
-                pause = max(5, API_PAUSE * 2)  # Pausa moderada
-
-            # Si además tenemos información del tiempo de reinicio
-            if reset_time and reset_time.isdigit():
-                reset_seconds = int(reset_time)
-                if reset_seconds < 60:  # Si estamos cerca del reinicio del contador
-                    pause = max(
-                        pause, reset_seconds / 2
-                    )  # Esperar una parte del tiempo hasta el reinicio
-
-        except (ValueError, TypeError):
-            pass  # Si hay error en la conversión, usar la pausa base
-
-    # Pausa preventiva periódica
-    if API_CALLS_COUNT > 0 and API_CALLS_COUNT % 40 == 0:
-        pause = max(pause, 15)  # Pausa extendida cada 40 llamadas
-
-    return pause
-
-
-def api_call(url, params):
-    """Realiza una llamada a la API con manejo automático de límites de tasa"""
-    global API_CALLS_COUNT, RATE_LIMIT_HITS, LAST_API_CALL_TIME
-
-    # Verificar si estamos haciendo demasiadas llamadas en poco tiempo
-    if API_CALLS_COUNT > 0 and API_CALLS_COUNT % 50 == 0:
-        print(f"Pausa preventiva después de {API_CALLS_COUNT} llamadas a la API...")
-        time.sleep(30)  # Pausa preventiva cada 50 llamadas
-
-    # Si es la primera llamada, no hay espera inicial
-    if LAST_API_CALL_TIME is not None:
-        # Calcular tiempo transcurrido desde la última llamada
-        elapsed = time.time() - LAST_API_CALL_TIME
-
-        # Si no ha pasado suficiente tiempo, esperar
-        if elapsed < API_PAUSE:
-            time.sleep(API_PAUSE - elapsed)
-
-    retries = 0
-    while retries <= MAX_RATE_LIMIT_RETRIES:
-        try:
-            # Actualizar tiempo de la última llamada
-            LAST_API_CALL_TIME = time.time()
-
-            # Incrementar contador de llamadas
-            API_CALLS_COUNT += 1
-
-            # Realizar la llamada a la API
-            r = requests.get(url, params=params, timeout=30)
-
-            # Verificar headers relacionados con límites de tasa si están disponibles
-            remaining = r.headers.get("X-Discogs-Ratelimit-Remaining")
-            reset_time = r.headers.get("X-Discogs-Ratelimit-Reset")
-
-            # Mostrar información de límites si está disponible
-            if remaining:
-                if int(remaining) < 10:
-                    print(
-                        f"¡Advertencia! Solo quedan {remaining} solicitudes disponibles."
-                    )
-
-                    if reset_time:
-                        print("Límite se reiniciará en {} segundos.".format(reset_time))
-
-            # Determinar pausa dinámica basada en el estado de límites
-            dynamic_pause = calculate_dynamic_pause(remaining, reset_time)
-
-            # Manejar límites de tasa
-            if r.status_code == 429:  # Código de límite de tasa excedido
-                RATE_LIMIT_HITS += 1
-                retries += 1
-
-                if retries <= MAX_RATE_LIMIT_RETRIES:
-                    # Aumentar el tiempo de espera exponencialmente con cada reintento
-                    wait_time = RATE_LIMIT_COOLDOWN * (2 ** (retries - 1))
-                    print(
-                        "Límite de tasa alcanzado ({}). Esperando {} segundos "
-                        "antes de reintentar...".format(
-                            RATE_LIMIT_HITS,
-                            wait_time,
-                        )
-                    )
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    print("Máximo de reintentos alcanzado. Cancelando solicitud.")
-                    return None
-
-            # Si es exitoso, esperar un tiempo dinámico para no sobrecargar la API
-            time.sleep(dynamic_pause)
-            return r
-
-        except requests.exceptions.RequestException as e:
-            print(f"Error de conexión: {e}")
-            return None
-
-    return None
-
-
 # Ejecutar
 if __name__ == "__main__":
+    init_runtime()
     import argparse
 
     # Configurar argumentos de línea de comandos para mayor flexibilidad
@@ -857,6 +1057,15 @@ if __name__ == "__main__":
         type=int,
         default=5,
         help="Número máximo de usuarios a procesar",
+    )
+    parser.add_argument(
+        "--extra-seeds",
+        help="Lista separada por comas de seeds adicionales para discovery",
+    )
+    parser.add_argument(
+        "--seeds-file",
+        type=Path,
+        help="Archivo con seeds (uno por línea) para discovery adicional",
     )
     parser.add_argument("--token", "-t", help="Token de Discogs (opcional)")
     parser.add_argument(
@@ -911,12 +1120,21 @@ if __name__ == "__main__":
     # Modificar populate_recommendation_system para usar las nuevas opciones
     def populate_recommendation_system_with_options(seed_username, max_users):
         """Versión modificada de populate_recommendation_system con soporte para skipeo de usuarios"""
+        init_runtime()
         print("Iniciando población de base de datos para sistema de recomendación...")
         print(f"Modo forzado: {'ACTIVADO' if FORCE_UPDATE else 'DESACTIVADO'}")
         print(f"Pausa entre llamadas API: {API_PAUSE} segundos")
 
         # Descubrir usuarios automáticamente
-        users = discover_users(seed_username, max_users)
+        extra_seeds = []
+        if args.extra_seeds:
+            extra_seeds.extend([seed.strip() for seed in args.extra_seeds.split(",")])
+        if args.seeds_file and args.seeds_file.exists():
+            extra_seeds.extend(
+                [seed.strip() for seed in args.seeds_file.read_text().splitlines()]
+            )
+
+        users = discover_users(seed_username, max_users, extra_seeds=extra_seeds)
 
         # Comprobar si debemos continuar desde un usuario específico
         continue_processing = True

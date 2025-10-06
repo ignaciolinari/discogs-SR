@@ -1,6 +1,8 @@
 import sqlite3
 
-conn = sqlite3.connect("datos/discogs.db")
+from settings import get_database_path
+
+conn = sqlite3.connect(str(get_database_path()))
 cursor = conn.cursor()
 
 print("Tablas en la base de datos:")

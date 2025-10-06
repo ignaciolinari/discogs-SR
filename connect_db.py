@@ -1,7 +1,9 @@
 import sqlite3
 
+import settings
+
 # Conectarse a la base que ya creaste
-con = sqlite3.connect("discogs.db")
+con = sqlite3.connect(str(settings.get_database_path()))
 cursor = con.cursor()
 
 # Insertar usuario de prueba

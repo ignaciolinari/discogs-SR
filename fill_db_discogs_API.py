@@ -135,13 +135,15 @@ def fetch_collection(cursor: sqlite3.Cursor, username: str, delay: float) -> int
     return collected
 
 
-def process_user(username: str) -> None:
+def process_user(username: str, delay: float = 1.0) -> None:
     username = username.strip()
     if not username:
         return
 
     print(f"\nProcesando colección para {username}")
-    new_records = fetch_collection(username)
+    with sqlite3.connect(str(DATABASE_PATH)) as connection:
+        cursor = connection.cursor()
+        new_records = fetch_collection(cursor, username, delay=delay)
     print(f"Colección de {username} sincronizada. Nuevos registros: {new_records}")
 
 
