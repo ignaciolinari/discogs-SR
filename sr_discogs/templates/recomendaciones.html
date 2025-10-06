@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+	<meta charset="UTF-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+	<script src="https://cdn.tailwindcss.com"></script>
+	<link href="https://cdn.jsdelivr.net/npm/daisyui@5" rel="stylesheet" type="text/css" />
+	<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+	<link href="https://cdn.jsdelivr.net/npm/daisyui@5/themes.css" rel="stylesheet" type="text/css" />
+
+	<title>Recomendaciones para {{ id_usuario }}</title>
+</head>
+
+<body class="px-6 py-4">
+	<div class="flex justify-between">
+		<h1 class="mb-4 text-lg font-bold">Recomendaciones de Discos para {{ id_usuario }}</h1>
+		<div>
+			<small>{{ cant_vistos }} vistos, {{ cant_valorados }} valorados - <a href="/reset"
+					class="bg-teal-400 text-white font-semibold text-xs px-2 py-1 mt-2 rounded cursor-pointer">reset</a>
+			</small>
+		</div>
+	</div>
+
+
+	<form method="post" action="/recomendaciones">
+		<div class="grid grid-cols-3 gap-4">
+			{% for disco in discos_recomendados %}
+			<div class="card card-side bg-base-100 shadow-sm border bg-base-100">
+
+				<img src="{{ disco.image_url }}" class="w-full max-w-40" onerror="this.src='https://via.placeholder.com/150?text=No+Image'" />
+
+				<div class="card-body">
+					<h2 class="card-title font-semibold link">
+						<a href="/recomendaciones/{{disco.item_id}}">{{ disco.title|title }}</a>
+					</h2>
+					<span class="text-sm">
+						{{ disco.artist|title }} - {{ disco.genre }} - {{ disco.year }}
+					</span>
+					{% if disco.style %}
+					<span class="text-xs">{{ disco.style|truncate(400) }}</span>
+					{% endif %}
+
+					<div class="card-actions justify-end items-center mt-auto">
+
+						<div class="flex">
+							<label for="{{disco.item_id}}" class="flex-none mr-2">Mi puntuación:</label>
+							<select name="{{disco.item_id}}" class="px-4 py-1 text-sm border rounded ">
+								<option value="0" selected></option>
+								<option value="1">1</option>
+								<option value="2">2</option>
+								<option value="3">3</option>
+								<option value="4">4</option>
+								<option value="5">5</option>
+								<option value="6">6</option>
+								<option value="7">7</option>
+								<option value="8">8</option>
+								<option value="9">9</option>
+								<option value="10">10</option>
+							</select>
+						</div>
+
+					</div>
+				</div>
+			</div>
+			{% endfor %}
+		</div>
+
+		<div class="flex justify-end">
+			<input type="submit" class="bg-teal-400 text-white font-semibold px-4 py-1 mt-2 rounded cursor-pointer"
+				value="Más recomendaciones">
+		</div>
+	</form>
+</body>
+
+</html>

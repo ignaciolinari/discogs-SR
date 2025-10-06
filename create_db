@@ -1,0 +1,30 @@
+-- Tabla de usuarios
+CREATE TABLE users (
+    user_id TEXT PRIMARY KEY,
+    username TEXT,
+    location TEXT,
+    joined_date TEXT
+);
+
+-- Tabla de ítems (álbumes / releases en Discogs)
+CREATE TABLE items (
+    item_id INTEGER PRIMARY KEY,
+    title TEXT,
+    artist TEXT,
+    year INTEGER,
+    genre TEXT,
+    style TEXT,
+    image_url TEXT
+);
+
+-- Tabla de interacciones (colecciones, wantlist, ratings si hubiera)
+CREATE TABLE interactions (
+    interaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT,
+    item_id INTEGER,
+    interaction_type TEXT, -- "collection", "wantlist", "rating"
+    rating INTEGER,        -- opcional (1-5)
+    date_added TEXT,
+    FOREIGN KEY (user_id) REFERENCES users(user_id),
+    FOREIGN KEY (item_id) REFERENCES items(item_id)
+);
