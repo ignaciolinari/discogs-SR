@@ -18,10 +18,6 @@ except RuntimeError as err:
 DEFAULT_USERNAME = get_seed_username()
 DATABASE_PATH = get_database_path()
 
-# Conexión DB
-con = sqlite3.connect(str(DATABASE_PATH))
-cursor = con.cursor()
-
 
 def interaction_exists(
     cursor: sqlite3.Cursor, user_id: str, item_id: int, interaction_type: str

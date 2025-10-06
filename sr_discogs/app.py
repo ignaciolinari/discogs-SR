@@ -3,7 +3,6 @@ from flask import Flask, make_response, redirect, render_template, request
 import recomendar
 
 app = Flask(__name__)
-app.debug = True
 
 
 @app.get("/")
@@ -26,7 +25,7 @@ def post_index():
             "id_usuario",
             id_usuario,
             httponly=True,
-            secure=False,
+            secure=request.is_secure,
             samesite="Lax",
         )
         return res

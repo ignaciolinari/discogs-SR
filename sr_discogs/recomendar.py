@@ -23,6 +23,23 @@ DATABASE_FILE = str(get_database_path())
 ###
 
 
+def normalize_rating(value):
+    """Normaliza ratings a escala entera 0-5."""
+
+    if value is None:
+        return 0
+
+    try:
+        rating = int(value)
+    except (TypeError, ValueError):
+        return 0
+
+    if rating <= 0:
+        return 0
+
+    return min(rating, 5)
+
+
 def sql_execute(query, params=None):
     with sqlite3.connect(DATABASE_FILE) as con:
         cur = con.cursor()
@@ -70,6 +87,7 @@ def usuario_existe(id_usuario):
 def insertar_interacciones(id_disco, id_usuario, rating):
     if not id_usuario:
         return
+    rating_value = normalize_rating(rating)
     # Primero verificar si ya existe una interacción para este usuario y disco
     query_check = (
         "SELECT interaction_id FROM interactions WHERE item_id = ? AND user_id = ?;"
@@ -81,15 +99,15 @@ def insertar_interacciones(id_disco, id_usuario, rating):
         query = (
             "UPDATE interactions SET rating = ? " "WHERE item_id = ? AND user_id = ?;"
         )
-        sql_execute(query, [rating, id_disco, id_usuario])
+        sql_execute(query, [rating_value, id_disco, id_usuario])
     else:
         # Si no existe, insertar nuevo
-        interaction_type = "rating" if rating and rating > 0 else "view"
+        interaction_type = "rating" if rating_value and rating_value > 0 else "view"
         query = (
             "INSERT INTO interactions(item_id, user_id, interaction_type, rating, "
             "date_added) VALUES (?, ?, ?, ?, date('now'));"
         )
-        sql_execute(query, [id_disco, id_usuario, interaction_type, rating])
+        sql_execute(query, [id_disco, id_usuario, interaction_type, rating_value])
     return
 
 
@@ -173,13 +191,29 @@ def recomendar_contexto(
 ):
     if not id_usuario:
         return []
+    vistos = items_vistos(id_usuario)
     if not discos_relevantes:
         discos_relevantes = items_valorados(id_usuario)
 
     if not discos_desconocidos:
-        discos_desconocidos = items_desconocidos(id_usuario)
+        discos_desconocidos = [
+            item_id for item_id in items_desconocidos(id_usuario) if item_id != id_disco
+        ]
 
-    return recomendar_azar(id_usuario, discos_relevantes, discos_desconocidos, N)
+    if id_disco in discos_desconocidos:
+        discos_desconocidos.remove(id_disco)
+
+    candidatos = [item for item in discos_desconocidos if item not in vistos]
+    if not candidatos:
+        candidatos = [item for item in discos_desconocidos if item != id_disco]
+
+    if not candidatos:
+        return []
+
+    if len(candidatos) < N:
+        N = len(candidatos)
+
+    return random.sample(candidatos, N)
 
 
 ###

@@ -174,16 +174,12 @@ def persist_visited_users(visited):
         print(f"No se pudo guardar el cache de usuarios visitados: {exc}")
 
 
-# Variables globales para control de skipping
+# Variables globales para control de skipping y rate limiting
 FORCE_UPDATE = False
 MIN_ITEMS_THRESHOLD = 50
 API_PAUSE = get_api_pause()  # Pausa entre llamadas API en segundos
-MAX_RATE_LIMIT_RETRIES = (
-    5  # Número de intentos si se alcanza el límite de tasa (aumentado)
-)
-RATE_LIMIT_COOLDOWN = (
-    60  # Tiempo de espera en segundos cuando se alcanza el límite de tasa (aumentado)
-)
+MAX_RATE_LIMIT_RETRIES = 5  # Número de intentos si se alcanza el límite de tasa
+RATE_LIMIT_COOLDOWN = 60  # Tiempo de espera en segundos cuando se alcanza el límite
 API_ADAPTIVE_PAUSE = False  # Pausas adaptativas basadas en la carga del servidor
 
 # Contadores globales para monitorear uso de la API
@@ -697,8 +693,8 @@ def get_user_submissions(username, limit=20):
     params = {"token": DISCOGS_TOKEN, "page": 1, "per_page": limit}
 
     try:
-        r = requests.get(url, params=params)
-        if r.status_code == 200:
+        r = api_call(url, params)
+        if r and r.status_code == 200:
             data = r.json()
             contributions = data.get("contributions", [])
 
@@ -731,54 +727,45 @@ def get_user_submissions(username, limit=20):
 
                         # Solo si el ítem no existe, obtenemos sus detalles
                         if not item_exists(release_id):
-                            # Obtener detalles de este release
                             release_url = f"{BASE_URL}/releases/{entity_id}"
-                            try:
-                                r_detail = requests.get(
-                                    release_url, params={"token": DISCOGS_TOKEN}
-                                )
-                                if r_detail.status_code == 200:
-                                    release_data = r_detail.json()
-
-                                    # Extraer información clave
-                                    title = release_data.get("title", "Unknown Title")
-                                    year = release_data.get("year")
-
-                                    # Extraer artista(s)
-                                    artists = release_data.get("artists", [])
-                                    artist_names = [
-                                        a.get("name", "Unknown Artist") for a in artists
-                                    ]
-                                    artist = (
-                                        ", ".join(artist_names)
-                                        if artist_names
-                                        else "Unknown Artist"
-                                    )
-
-                                    # Géneros y estilos
-                                    genres = ", ".join(release_data.get("genres", []))
-                                    styles = ", ".join(release_data.get("styles", []))
-
-                                    # Imagen
-                                    images = release_data.get("images", [])
-                                    image_url = images[0].get("uri") if images else None
-
-                                    # Guardar como ítem en la base de datos
-                                    insert_item(
-                                        release_id,
-                                        title,
-                                        artist,
-                                        year,
-                                        genres,
-                                        styles,
-                                        image_url,
-                                    )
-
-                                    # No hacer demasiadas peticiones seguidas
-                                    time.sleep(1)
-                            except Exception as e:
-                                print(f"Error procesando contribución {entity_id}: {e}")
+                            release_data = safe_api_json(
+                                release_url,
+                                params={"token": DISCOGS_TOKEN},
+                                context=f"release {entity_id}",
+                            )
+                            if not release_data:
                                 continue
+
+                            title = release_data.get("title", "Unknown Title")
+                            year = release_data.get("year")
+
+                            artists = release_data.get("artists", [])
+                            artist_names = [
+                                a.get("name", "Unknown Artist") for a in artists
+                            ]
+                            artist = (
+                                ", ".join(artist_names)
+                                if artist_names
+                                else "Unknown Artist"
+                            )
+
+                            genres = ", ".join(release_data.get("genres", []))
+                            styles = ", ".join(release_data.get("styles", []))
+
+                            images = release_data.get("images", [])
+                            image_url = images[0].get("uri") if images else None
+
+                            insert_item(
+                                release_id,
+                                title,
+                                artist,
+                                year,
+                                genres,
+                                styles,
+                                image_url,
+                            )
+
+                            time.sleep(API_PAUSE)
 
                         # Guardar una interacción de tipo "contribution" para indicar que el usuario
                         # contribuyó con información sobre este ítem (alta afinidad/conocimiento)
@@ -1018,24 +1005,6 @@ def populate_recommendation_system(seed_username="Xmipod", max_users=5):
     print("\nBase de datos para recomendaciones generada correctamente.")
 
 
-# Variables globales para control de skipping
-FORCE_UPDATE = False
-MIN_ITEMS_THRESHOLD = 50
-API_PAUSE = get_api_pause()  # Pausa entre llamadas API en segundos
-MAX_RATE_LIMIT_RETRIES = (
-    5  # Número de intentos si se alcanza el límite de tasa (aumentado)
-)
-RATE_LIMIT_COOLDOWN = (
-    60  # Tiempo de espera en segundos cuando se alcanza el límite de tasa (aumentado)
-)
-API_ADAPTIVE_PAUSE = False  # Pausas adaptativas basadas en la carga del servidor
-
-# Contadores globales para monitorear uso de la API
-API_CALLS_COUNT = 0
-RATE_LIMIT_HITS = 0
-LAST_API_CALL_TIME = None
-
-
 # Ejecutar
 if __name__ == "__main__":
     init_runtime()
@@ -1136,11 +1105,21 @@ if __name__ == "__main__":
 
         users = discover_users(seed_username, max_users, extra_seeds=extra_seeds)
 
-        # Comprobar si debemos continuar desde un usuario específico
+        continue_target = None
         continue_processing = True
         if args.continue_from:
-            continue_processing = False
-            print(f"Buscando usuario para continuar: {args.continue_from}")
+            continue_target = args.continue_from.strip()
+            if continue_target:
+                discovered_lower = {user.lower(): user for user in users}
+                if continue_target.lower() not in discovered_lower:
+                    print(
+                        f"Advertencia: el usuario '{continue_target}' no fue descubierto en esta corrida; se procesarán todos los usuarios."
+                    )
+                else:
+                    continue_processing = False
+                    print(
+                        f"Continuando desde usuario: {discovered_lower[continue_target.lower()]}"
+                    )
 
         # Contador para mostrar progreso
         processed_count = 0
@@ -1153,12 +1132,12 @@ if __name__ == "__main__":
 
                 # Si estamos en modo continuar y no hemos llegado al usuario deseado, saltamos
                 if not continue_processing:
-                    if username == args.continue_from:
+                    if username.lower() == continue_target.lower():
                         continue_processing = True
-                        print(f"Continuando desde usuario: {username}")
+                        print(f"Reanudando procesamiento en: {username}")
                     else:
                         print(
-                            f"Saltando usuario {username} (esperando llegar a {args.continue_from})"
+                            f"Saltando usuario {username} (esperando llegar a {continue_target})"
                         )
                         continue
 
@@ -1261,13 +1240,12 @@ if __name__ == "__main__":
         with open(".last_processed_user.txt", "r") as f:
             last_user = f.read().strip()
             if last_user:
-                print(f"Encontrado archivo de último usuario procesado: {last_user}")
-                continuar = input(
-                    "¿Deseas continuar desde este usuario? (s/n): "
-                ).lower()
-                if continuar.startswith("s"):
-                    args.continue_from = last_user
-                    print(f"Continuando desde el usuario: {last_user}")
+                print(
+                    "Encontrado archivo de último usuario procesado: {}. Ejecuta el script con --continue-from '{}' para reanudar.".format(
+                        last_user,
+                        last_user,
+                    )
+                )
 
     # Registrar tiempo de inicio para estadísticas
     start_time = datetime.now()
