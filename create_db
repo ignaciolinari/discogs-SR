@@ -23,8 +23,11 @@ CREATE TABLE interactions (
     user_id TEXT,
     item_id INTEGER,
     interaction_type TEXT, -- "collection", "wantlist", "rating"
-    rating INTEGER,        -- opcional (1-5)
+    rating REAL,        -- opcional (1-5)
     date_added TEXT,
     FOREIGN KEY (user_id) REFERENCES users(user_id),
     FOREIGN KEY (item_id) REFERENCES items(item_id)
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_interactions_unique
+ON interactions (user_id, item_id, interaction_type);

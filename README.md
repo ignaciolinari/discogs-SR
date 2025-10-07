@@ -76,6 +76,7 @@ Variables relevantes:
 |--------|---------------|-------------|----------------|
 | `fill_db_discogs_API.py` | CLI liviano | Solo colección (folder 0) de usuarios puntuales | Poblar rápido perfiles para demo o debugging |
 | `fill_db_recommendation_system.py` | Crawler completo | Colección, wantlist, contribuciones + descubrimiento BFS | Correr sesiones largas, nutrir el dataset para recomendaciones |
+| `scrape_discogs_site.py` | Scraper HTML | Releases populares, usuarios detectados (Have/Want) y reviews con rating | Cuando el rate limit de la API resulta bloqueante |
 
 Ambos scripts escriben en la misma base configurada por `get_database_path()`.
 
@@ -139,6 +140,33 @@ nohup python fill_db_recommendation_system.py \
 
 Para correr en primer plano (sin `nohup` ni background) simplemente omite `nohup` y el `&` final.
 
+### Scraping vía HTML (sin API)
+
+Cuando la API no alcanza por límites de rate o porque queremos ratings de reviews públicas, podés usar el scraper HTML:
+
+```bash
+python scrape_discogs_site.py \
+  --pages 5 \
+  --limit 200 \
+  --delay 2.5 \
+  --log-level INFO
+```
+
+El scraper recorre resultados de búsqueda ordenados por `Have`, visita cada release y extrae:
+
+- Metadatos del release (artistas, año, géneros, carátula).
+- Usuarios vinculados en las secciones _Have_ / _Want_ (se almacenan como `interaction_type = collection` o `wantlist`).
+- Reviews con rating (se guarda `interaction_type = rating` y el puntaje de 1-5).
+- Información básica del perfil del usuario (ubicación, fecha de alta, tamaño de colección/wantlist cuando se muestra públicamente).
+
+Parámetros útiles:
+
+- `--no-profile`: salta la visita a páginas de usuario si solo necesitás las interacciones.
+- `--database /ruta/otra.db`: escribe en una base alternativa.
+- `--search-url`: permite arrancar desde cualquier consulta de Discogs, ej. `/search/?genre=house&type=release`.
+
+> **Nota**: el scraper usa pauses adaptativas y `User-Agent` rotativo básico, pero respetar robots y límites de Discogs sigue siendo responsabilidad del operador. Si el sitio devuelve 403/429 el proceso se detiene tras varios reintentos.
+
 ## Ejecutar la app web
 
 ```bash
@@ -196,3 +224,9 @@ python -c "import fill_db_recommendation_system as m; m.init_runtime(); m.run_te
 ```
 
 Esto valida los mocks de `get_user_neighbors` y `discover_users`. Podés pasar el token directo: `m.init_runtime(token="tu_token")` si preferís no exportarlo.
+
+Para probar los parsers HTML sin salir a la web:
+
+```bash
+python -m unittest tests.test_parsers
+```
