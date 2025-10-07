@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import argparse
 import logging
+import sys
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from .db import (
@@ -27,6 +31,27 @@ from .parsers import (
 logger = logging.getLogger(__name__)
 
 _SEARCH_PATH = "/search/"
+
+
+@dataclass(slots=True)
+class ScrapeStats:
+    releases_processed: int
+    items_added: int
+    users_added: int
+    interactions_added: int
+    total_items: int
+    total_users: int
+    total_interactions: int
+
+
+def _get_table_counts(cursor) -> tuple[int, int, int]:
+    cursor.execute("SELECT COUNT(*) FROM users")
+    users = int(cursor.fetchone()[0])
+    cursor.execute("SELECT COUNT(*) FROM items")
+    items = int(cursor.fetchone()[0])
+    cursor.execute("SELECT COUNT(*) FROM interactions")
+    interactions = int(cursor.fetchone()[0])
+    return users, items, interactions
 
 
 class DiscogsScraperPipeline:
@@ -65,7 +90,7 @@ class DiscogsScraperPipeline:
         release_type: str = "release",
         max_pages: int = 5,
         release_limit: Optional[int] = None,
-    ) -> int:
+    ) -> ScrapeStats:
         """Entry point to crawl search results and ingest releases.
 
         Args:
@@ -75,7 +100,7 @@ class DiscogsScraperPipeline:
             max_pages: maximum number of search pages to crawl.
             release_limit: overall release cap (across pages).
         Returns:
-            Number of releases processed successfully.
+            Summary statistics for the scraping run.
         """
 
         processed = 0
@@ -84,6 +109,7 @@ class DiscogsScraperPipeline:
         with get_connection(self.db_config) as connection:
             ensure_schema(connection)
             cursor = connection.cursor()
+            start_users, start_items, start_interactions = _get_table_counts(cursor)
 
             for page_number in range(1, max_pages + 1):
                 if release_limit is not None and processed >= release_limit:
@@ -127,7 +153,17 @@ class DiscogsScraperPipeline:
 
             connection.commit()
 
-        return processed
+            end_users, end_items, end_interactions = _get_table_counts(cursor)
+
+        return ScrapeStats(
+            releases_processed=processed,
+            items_added=max(end_items - start_items, 0),
+            users_added=max(end_users - start_users, 0),
+            interactions_added=max(end_interactions - start_interactions, 0),
+            total_items=end_items,
+            total_users=end_users,
+            total_interactions=end_interactions,
+        )
 
     def _fetch_release_detail(self, summary: ReleaseSummary) -> ReleaseDetail:
         response = self.session.get(summary.url)
@@ -342,3 +378,143 @@ class DiscogsScraperPipeline:
                 break
 
         return collected
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Scrape Discogs HTML pages and populate the local database.",
+    )
+    parser.add_argument(
+        "--search-url",
+        default=_SEARCH_PATH,
+        help="Discogs search path to crawl (default: /search/).",
+    )
+    parser.add_argument(
+        "--sort",
+        default="have,desc",
+        help="Sort parameter accepted by Discogs search (default: have,desc).",
+    )
+    parser.add_argument(
+        "--release-type",
+        default="release",
+        help="Discogs search type filter (default: release).",
+    )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=5,
+        help="Maximum number of search result pages to crawl.",
+    )
+    parser.add_argument(
+        "--release-limit",
+        type=int,
+        default=None,
+        help="Overall release cap across all pages (default: unlimited).",
+    )
+    parser.add_argument(
+        "--min-delay",
+        type=float,
+        default=2.0,
+        help="Minimum delay between HTTP requests in seconds.",
+    )
+    parser.add_argument(
+        "--delay-jitter",
+        type=float,
+        default=0.0,
+        help="Additional random delay jitter applied to each request.",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=4,
+        help="Maximum number of retries for transient HTTP failures.",
+    )
+    parser.add_argument(
+        "--backoff-factor",
+        type=float,
+        default=2.5,
+        help="Backoff multiplier applied between retries.",
+    )
+    parser.add_argument(
+        "--max-user-pages",
+        type=int,
+        default=3,
+        help="Number of additional user pages to fetch per release.",
+    )
+    parser.add_argument(
+        "--skip-user-profiles",
+        dest="fetch_user_profiles",
+        action="store_false",
+        help="Disable fetching user profile pages.",
+    )
+    parser.add_argument(
+        "--no-extended-users",
+        dest="fetch_extended_users",
+        action="store_false",
+        help="Disable fetching extended have/want user lists.",
+    )
+    parser.add_argument(
+        "--db-path",
+        type=Path,
+        default=None,
+        help="Optional explicit path to the SQLite database file.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        help="Logging level (DEBUG, INFO, WARNING, ...).",
+    )
+    parser.set_defaults(fetch_user_profiles=True, fetch_extended_users=True)
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+    )
+
+    db_config = None
+    if args.db_path:
+        db_config = DatabaseConfig(path=args.db_path)
+
+    pipeline = DiscogsScraperPipeline(
+        db_config=db_config,
+        min_delay=args.min_delay,
+        delay_jitter=args.delay_jitter,
+        max_retries=args.max_retries,
+        backoff_factor=args.backoff_factor,
+        fetch_user_profiles=args.fetch_user_profiles,
+        fetch_extended_users=args.fetch_extended_users,
+        max_user_pages=args.max_user_pages,
+    )
+
+    stats = pipeline.crawl(
+        search_url=args.search_url,
+        sort=args.sort,
+        release_type=args.release_type,
+        max_pages=args.max_pages,
+        release_limit=args.release_limit,
+    )
+
+    logger.info(
+        "Scraping completed. Releases processed: %s | new items: %s | new users: %s | new interactions: %s",
+        stats.releases_processed,
+        stats.items_added,
+        stats.users_added,
+        stats.interactions_added,
+    )
+    logger.info(
+        "Database totals -> items: %s | users: %s | interactions: %s",
+        stats.total_items,
+        stats.total_users,
+        stats.total_interactions,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

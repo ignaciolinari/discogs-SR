@@ -1,6 +1,6 @@
 # Discogs Recommender
 
-Sistema experimental para recolectar datos públicos de la API de Discogs y generar recomendaciones de discos. El catálogo completo de Discogs supera los ~16 millones de lanzamientos y ~8 millones de usuarios; este proyecto se enfoca en explorar una fracción  de ese universo.
+Sistema experimental para recolectar datos públicos de la API de Discogs y generar recomendaciones de discos. El catálogo completo de Discogs supera los ~18 millones de lanzamientos y ~8 millones de usuarios; este proyecto se enfoca en explorar una fracción  de ese universo.
 
 ## Características
 
@@ -8,6 +8,7 @@ Sistema experimental para recolectar datos públicos de la API de Discogs y gene
 - Aplicación web en Flask (`sr_discogs/app.py`) para experimentar con recomendaciones aleatorias sobre la base.
 - Esquema SQLite sencillo (`create_db`) con usuarios, ítems e interacciones.
 - Hooks pre-commit configurados (`.pre-commit-config.yaml`) para mantener estilo (Black, isort, flake8, etc.).
+- Scraper HTML invocable como módulo (`python -m scraper.pipeline`) con resumen automático de nuevos ítems/usuarios/interacciones y totales de la base.
 
 ## Estructura
 
@@ -145,10 +146,11 @@ Para correr en primer plano (sin `nohup` ni background) simplemente omite `nohup
 Cuando la API no alcanza por límites de rate o porque queremos ratings de reviews públicas, podés usar el scraper HTML:
 
 ```bash
-python scrape_discogs_site.py \
-  --pages 5 \
-  --limit 200 \
-  --delay 2.5 \
+python -m scraper.pipeline \
+  --max-pages 5 \
+  --release-limit 200 \
+  --min-delay 2.5 \
+  --delay-jitter 1.5 \
   --log-level INFO
 ```
 
@@ -164,6 +166,16 @@ Parámetros útiles:
 - `--no-profile`: salta la visita a páginas de usuario si solo necesitás las interacciones.
 - `--database /ruta/otra.db`: escribe en una base alternativa.
 - `--search-url`: permite arrancar desde cualquier consulta de Discogs, ej. `/search/?genre=house&type=release`.
+- `--release-limit`, `--max-pages`, `--min-delay`, `--delay-jitter`, `--max-retries`, `--backoff-factor`: control fino del crawling y las pausas.
+
+Al finalizar imprime dos líneas con el resumen:
+
+```
+[INFO] Scraping completed. Releases processed: 120 | new items: 95 | new users: 48 | new interactions: 310
+[INFO] Database totals -> items: 45734 | users: 42 | interactions: 47627
+```
+
+El script antiguo `scrape_discogs_site.py` continúa disponible como envoltorio del pipeline para usos existentes.
 
 > **Nota**: el scraper usa pauses adaptativas y `User-Agent` rotativo básico, pero respetar robots y límites de Discogs sigue siendo responsabilidad del operador. Si el sitio devuelve 403/429 el proceso se detiene tras varios reintentos.
 

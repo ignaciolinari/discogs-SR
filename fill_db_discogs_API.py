@@ -1,14 +1,17 @@
 import argparse
-import sqlite3
+import logging
 import time
 from pathlib import Path
 from typing import Iterable, List
 
 import requests
 
+from ingestion.db import IngestionRepository, RepositoryConfig
 from settings import get_database_path, get_discogs_token, get_seed_username
 
 BASE_URL = "https://api.discogs.com"
+
+logger = logging.getLogger(__name__)
 
 try:
     DISCOGS_TOKEN = get_discogs_token()
@@ -19,65 +22,7 @@ DEFAULT_USERNAME = get_seed_username()
 DATABASE_PATH = get_database_path()
 
 
-def interaction_exists(
-    cursor: sqlite3.Cursor, user_id: str, item_id: int, interaction_type: str
-) -> bool:
-    cursor.execute(
-        """
-        SELECT 1 FROM interactions
-        WHERE user_id = ? AND item_id = ? AND interaction_type = ?
-        """,
-        (user_id, item_id, interaction_type),
-    )
-    return cursor.fetchone() is not None
-
-
-def insert_user(cursor: sqlite3.Cursor, user_id: str, username: str) -> None:
-    cursor.execute(
-        """
-        INSERT OR IGNORE INTO users (user_id, username)
-        VALUES (?, ?)
-        """,
-        (user_id, username),
-    )
-
-
-def insert_item(
-    cursor: sqlite3.Cursor,
-    item_id: int,
-    title: str,
-    artist: str,
-    year: int | None,
-    genre: str,
-    style: str,
-    image_url: str | None,
-) -> None:
-    cursor.execute(
-        """
-        INSERT OR IGNORE INTO items (item_id, title, artist, year, genre, style, image_url)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (item_id, title, artist, year, genre, style, image_url),
-    )
-
-
-def insert_interaction(
-    cursor: sqlite3.Cursor,
-    user_id: str,
-    item_id: int,
-    interaction_type: str,
-    date_added: str,
-) -> None:
-    cursor.execute(
-        """
-        INSERT INTO interactions (user_id, item_id, interaction_type, date_added)
-        VALUES (?, ?, ?, ?)
-        """,
-        (user_id, item_id, interaction_type, date_added),
-    )
-
-
-def fetch_collection(cursor: sqlite3.Cursor, username: str, delay: float) -> int:
+def fetch_collection(repo: IngestionRepository, username: str, delay: float) -> int:
     collected = 0
     page = 1
     while True:
@@ -85,7 +30,12 @@ def fetch_collection(cursor: sqlite3.Cursor, username: str, delay: float) -> int
         params = {"token": DISCOGS_TOKEN, "page": page, "per_page": 50}
         response = requests.get(url, params=params, timeout=30)
         if response.status_code != 200:
-            print("Error:", response.json())
+            logger.error(
+                "Error %s obteniendo colección de %s: %s",
+                response.status_code,
+                username,
+                response.json(),
+            )
             break
 
         data = response.json()
@@ -109,19 +59,36 @@ def fetch_collection(cursor: sqlite3.Cursor, username: str, delay: float) -> int
 
             image_url = release["basic_information"].get("cover_image")
 
-            insert_user(cursor, username, username)
-            insert_item(
-                cursor, release_id, title, artist, year, genres, styles, image_url
+            repo.upsert_user(
+                user_id=username,
+                username=username,
+                location=None,
+                joined_date=None,
+            )
+            repo.upsert_item(
+                item_id=release_id,
+                title=title,
+                artist=artist,
+                year=year,
+                genres=genres,
+                styles=styles,
+                image_url=image_url,
             )
 
-            if not interaction_exists(cursor, username, release_id, "collection"):
-                insert_interaction(
-                    cursor, username, release_id, "collection", date_added
+            if not repo.interaction_exists(username, release_id, "collection"):
+                repo.record_interaction(
+                    user_id=username,
+                    item_id=release_id,
+                    interaction_type="collection",
+                    rating=None,
+                    date_added=date_added,
                 )
                 collected += 1
 
-        cursor.connection.commit()
-        print(f"Página {page} procesada ({len(releases)} ítems).")
+        repo.commit()
+        logger.info(
+            "Página %s procesada (%s ítems) para %s", page, len(releases), username
+        )
 
         if data["pagination"]["page"] >= data["pagination"]["pages"]:
             break
@@ -131,16 +98,20 @@ def fetch_collection(cursor: sqlite3.Cursor, username: str, delay: float) -> int
     return collected
 
 
-def process_user(username: str, delay: float = 1.0) -> None:
+def process_user(username: str, delay: float = 1.0) -> int:
     username = username.strip()
     if not username:
-        return
+        return 0
 
-    print(f"\nProcesando colección para {username}")
-    with sqlite3.connect(str(DATABASE_PATH)) as connection:
-        cursor = connection.cursor()
-        new_records = fetch_collection(cursor, username, delay=delay)
-    print(f"Colección de {username} sincronizada. Nuevos registros: {new_records}")
+    logger.info("Procesando colección para %s", username)
+    db_path = DATABASE_PATH or get_database_path()
+    repo_config = RepositoryConfig(path=db_path)
+    with IngestionRepository(repo_config) as repo:
+        new_records = fetch_collection(repo, username, delay=delay)
+    logger.info(
+        "Colección de %s sincronizada. Nuevos registros: %s", username, new_records
+    )
+    return new_records
 
 
 def iter_usernames(users: List[str], file_path: Path | None) -> Iterable[str]:
@@ -183,6 +154,11 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
     global DEFAULT_USERNAME
 
     total_new = 0
@@ -195,20 +171,14 @@ def main() -> None:
 
     for username in iter_usernames(args.users or [], args.users_file):
         processed += 1
-
-        with sqlite3.connect(str(DATABASE_PATH)) as connection:
-            cursor = connection.cursor()
-            print(f"\nProcesando colección para {username}")
-            collected = fetch_collection(cursor, username, delay)
-            total_new += collected
-            print(
-                f"Colección de {username} sincronizada. Nuevos registros: {collected}"
-            )
-
+        collected = process_user(username, delay)
+        total_new += collected
         time.sleep(delay)
 
-    print(
-        f"\nProceso completado. Usuarios procesados: {processed}. Nuevos registros: {total_new}."
+    logger.info(
+        "Proceso completado. Usuarios procesados: %s. Nuevos registros: %s.",
+        processed,
+        total_new,
     )
 
 

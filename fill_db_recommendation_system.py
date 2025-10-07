@@ -1,11 +1,12 @@
+import logging
 import os
-import sqlite3
 import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
 
-import requests
+from ingestion.db import IngestionRepository, RepositoryConfig
+from ingestion.http_client import RateLimitedDiscogsClient
 
 from settings import (
     get_api_pause,
@@ -18,8 +19,9 @@ BASE_URL = "https://api.discogs.com"
 DISCOGS_TOKEN = None
 DEFAULT_SEED_USERNAME = None
 DATABASE_PATH = None
-con = None
-cursor = None
+_repo_config: RepositoryConfig | None = None
+
+logger = logging.getLogger(__name__)
 
 DISCOVERY_MAX_DEPTH = 3
 MAX_LISTS_PER_USER = 5
@@ -36,18 +38,43 @@ POPULAR_USERS = [
 ]
 VISITED_USERS_FILE = Path(".discovered_users.log")
 DISCOVERY_PAUSE = 1.0
+_discogs_client: RateLimitedDiscogsClient | None = None
 
 
 def init_runtime(token=None):
-    global DISCOGS_TOKEN, DEFAULT_SEED_USERNAME, DATABASE_PATH, con, cursor
-    if DISCOGS_TOKEN is not None and con is not None:
-        return
+    global DISCOGS_TOKEN, DEFAULT_SEED_USERNAME, DATABASE_PATH, _repo_config, _discogs_client
 
-    DISCOGS_TOKEN = token or get_discogs_token()
-    DEFAULT_SEED_USERNAME = get_seed_username()
-    DATABASE_PATH = get_database_path()
-    con = sqlite3.connect(str(DATABASE_PATH))
-    cursor = con.cursor()
+    if token:
+        DISCOGS_TOKEN = token
+
+    if DISCOGS_TOKEN is None:
+        DISCOGS_TOKEN = get_discogs_token()
+    if DEFAULT_SEED_USERNAME is None:
+        DEFAULT_SEED_USERNAME = get_seed_username()
+    if DATABASE_PATH is None:
+        DATABASE_PATH = get_database_path()
+
+    if _repo_config is None:
+        _repo_config = RepositoryConfig(path=Path(DATABASE_PATH))
+
+    if _discogs_client is None:
+        _discogs_client = RateLimitedDiscogsClient(token=DISCOGS_TOKEN)
+    else:
+        _discogs_client.token = DISCOGS_TOKEN
+
+    _discogs_client.update_config(
+        pause=API_PAUSE,
+        adaptive_pause=API_ADAPTIVE_PAUSE,
+        max_rate_limit_retries=MAX_RATE_LIMIT_RETRIES,
+        rate_limit_cooldown=RATE_LIMIT_COOLDOWN,
+    )
+
+
+def _get_repo_config() -> RepositoryConfig:
+    if _repo_config is None:
+        init_runtime()
+    assert _repo_config is not None
+    return _repo_config
 
 
 def _mock_api_response(status_code=200, json_data=None):
@@ -182,127 +209,37 @@ MAX_RATE_LIMIT_RETRIES = 5  # Número de intentos si se alcanza el límite de ta
 RATE_LIMIT_COOLDOWN = 60  # Tiempo de espera en segundos cuando se alcanza el límite
 API_ADAPTIVE_PAUSE = False  # Pausas adaptativas basadas en la carga del servidor
 
-# Contadores globales para monitorear uso de la API
-API_CALLS_COUNT = 0
-RATE_LIMIT_HITS = 0
-LAST_API_CALL_TIME = None
+# Compat wrappers para el nuevo cliente compartido
 
 
-def calculate_dynamic_pause(remaining=None, reset_time=None):
-    """Calcula una pausa dinámica basada en el estado de límite de tasa"""
-    global API_CALLS_COUNT, LAST_API_CALL_TIME
+def _ensure_discogs_client() -> RateLimitedDiscogsClient:
+    """Garantiza que exista una instancia del cliente rate-limited."""
 
-    # Pausa base
-    pause = API_PAUSE
+    global _discogs_client
 
-    # Si la pausa adaptativa está activada y tenemos información de límites
-    if API_ADAPTIVE_PAUSE and remaining is not None:
-        try:
-            remaining = int(remaining)
+    if _discogs_client is None:
+        init_runtime()
 
-            # Ajustar la pausa de forma inversamente proporcional a las llamadas restantes
-            if remaining <= 10:
-                pause = max(
-                    10, API_PAUSE * 3
-                )  # Pausa extendida cuando quedan pocas llamadas
-            elif remaining <= 20:
-                pause = max(5, API_PAUSE * 2)  # Pausa moderada
+    if _discogs_client is None:
+        raise RuntimeError("Cliente de Discogs no inicializado")
 
-            # Si además tenemos información del tiempo de reinicio
-            if reset_time and reset_time.isdigit():
-                reset_seconds = int(reset_time)
-                if reset_seconds < 60:  # Si estamos cerca del reinicio del contador
-                    pause = max(
-                        pause, reset_seconds / 2
-                    )  # Esperar una parte del tiempo hasta el reinicio
-
-        except (ValueError, TypeError):
-            pass  # Si hay error en la conversión, usar la pausa base
-
-    # Pausa preventiva periódica
-    if API_CALLS_COUNT > 0 and API_CALLS_COUNT % 40 == 0:
-        pause = max(pause, 15)  # Pausa extendida cada 40 llamadas
-
-    return pause
+    return _discogs_client
 
 
-def api_call(url, params):
-    """Realiza una llamada a la API con manejo automático de límites de tasa"""
-    global API_CALLS_COUNT, RATE_LIMIT_HITS, LAST_API_CALL_TIME
+def api_call(url, params=None):
+    """Realiza una llamada GET usando el cliente con rate limiting compartido."""
 
-    # Verificar si estamos haciendo demasiadas llamadas en poco tiempo
-    if API_CALLS_COUNT > 0 and API_CALLS_COUNT % 50 == 0:
-        print(f"Pausa preventiva después de {API_CALLS_COUNT} llamadas a la API...")
-        time.sleep(30)  # Pausa preventiva cada 50 llamadas
+    client = _ensure_discogs_client()
+    prepared_params = dict(params or {})
+    return client.get(url, params=prepared_params)
 
-    # Si es la primera llamada, no hay espera inicial
-    if LAST_API_CALL_TIME is not None:
-        # Calcular tiempo transcurrido desde la última llamada
-        elapsed = time.time() - LAST_API_CALL_TIME
 
-        # Si no ha pasado suficiente tiempo, esperar
-        if elapsed < API_PAUSE:
-            time.sleep(API_PAUSE - elapsed)
+def _current_api_stats() -> tuple[int, int]:
+    """Devuelve (total_calls, rate_limit_hits) del cliente actual."""
 
-    retries = 0
-    while retries <= MAX_RATE_LIMIT_RETRIES:
-        try:
-            # Actualizar tiempo de la última llamada
-            LAST_API_CALL_TIME = time.time()
-
-            # Incrementar contador de llamadas
-            API_CALLS_COUNT += 1
-
-            # Realizar la llamada a la API
-            r = requests.get(url, params=params, timeout=30)
-
-            # Verificar headers relacionados con límites de tasa si están disponibles
-            remaining = r.headers.get("X-Discogs-Ratelimit-Remaining")
-            reset_time = r.headers.get("X-Discogs-Ratelimit-Reset")
-
-            # Mostrar información de límites si está disponible
-            if remaining:
-                if int(remaining) < 10:
-                    print(
-                        f"¡Advertencia! Solo quedan {remaining} solicitudes disponibles."
-                    )
-
-                    if reset_time:
-                        print("Límite se reiniciará en {} segundos.".format(reset_time))
-
-            # Determinar pausa dinámica basada en el estado de límites
-            dynamic_pause = calculate_dynamic_pause(remaining, reset_time)
-
-            # Manejar límites de tasa
-            if r.status_code == 429:  # Código de límite de tasa excedido
-                RATE_LIMIT_HITS += 1
-                retries += 1
-
-                if retries <= MAX_RATE_LIMIT_RETRIES:
-                    # Aumentar el tiempo de espera exponencialmente con cada reintento
-                    wait_time = RATE_LIMIT_COOLDOWN * (2 ** (retries - 1))
-                    print(
-                        "Límite de tasa alcanzado ({}). Esperando {} segundos "
-                        "antes de reintentar...".format(
-                            RATE_LIMIT_HITS,
-                            wait_time,
-                        )
-                    )
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    print("Máximo de reintentos alcanzado. Cancelando solicitud.")
-                    return None
-
-            # Si es exitoso, esperar un tiempo dinámico para no sobrecargar la API
-            time.sleep(dynamic_pause)
-            return r
-
-        except requests.exceptions.RequestException as e:
-            print(f"Error de conexión: {e}")
-            return None
-
-    return None
+    if _discogs_client is None:
+        return (0, 0)
+    return (_discogs_client.total_calls, _discogs_client.rate_limit_hits)
 
 
 def get_user_info(username):
@@ -358,72 +295,60 @@ def get_user_info(username):
     }
 
 
-def user_exists(user_id):
+def user_exists(repo: IngestionRepository, user_id):
     """Verifica si un usuario ya existe en la base de datos"""
-    cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
-    return cursor.fetchone() is not None
+
+    return repo.user_exists(user_id)
 
 
-def item_exists(item_id):
+def item_exists(repo: IngestionRepository, item_id):
     """Verifica si un ítem ya existe en la base de datos"""
-    cursor.execute("SELECT 1 FROM items WHERE item_id = ?", (item_id,))
-    return cursor.fetchone() is not None
+
+    return repo.item_exists(item_id)
 
 
-def interaction_exists(user_id, item_id, interaction_type):
+def interaction_exists(repo: IngestionRepository, user_id, item_id, interaction_type):
     """Verifica si una interacción específica ya existe en la base de datos"""
 
-    cursor.execute(
-        """
-    SELECT 1 FROM interactions
-    WHERE user_id = ? AND item_id = ? AND interaction_type = ?
-    """,
-        (user_id, item_id, interaction_type),
-    )
-    return cursor.fetchone() is not None
+    return repo.interaction_exists(user_id, item_id, interaction_type)
 
 
-def insert_user(user_id, username, location, joined_date):
-    cursor.execute(
-        """
-    INSERT OR IGNORE INTO users (user_id, username, location, joined_date)
-    VALUES (?, ?, ?, ?)
-    """,
-        (user_id, username, location, joined_date),
+def insert_user(repo: IngestionRepository, user_id, username, location, joined_date):
+    repo.upsert_user(
+        user_id=user_id,
+        username=username,
+        location=location,
+        joined_date=joined_date,
     )
 
 
-def insert_item(item_id, title, artist, year, genre, style, image_url):
-    cursor.execute(
-        """
-    INSERT OR IGNORE INTO items (item_id, title, artist, year, genre, style, image_url)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    """,
-        (item_id, title, artist, year, genre, style, image_url),
+def insert_item(
+    repo: IngestionRepository, item_id, title, artist, year, genre, style, image_url
+):
+    repo.upsert_item(
+        item_id=item_id,
+        title=title,
+        artist=artist,
+        year=year,
+        genres=genre,
+        styles=style,
+        image_url=image_url,
     )
 
 
-def insert_interaction(user_id, item_id, interaction_type, rating, date_added):
-    if interaction_exists(user_id, item_id, interaction_type):
-        cursor.execute(
-            """
-        UPDATE interactions
-        SET rating = ?, date_added = ?
-        WHERE user_id = ? AND item_id = ? AND interaction_type = ?
-        """,
-            (rating, date_added, user_id, item_id, interaction_type),
-        )
-    else:
-        cursor.execute(
-            """
-        INSERT INTO interactions (user_id, item_id, interaction_type, rating, date_added)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-            (user_id, item_id, interaction_type, rating, date_added),
-        )
+def insert_interaction(
+    repo: IngestionRepository, user_id, item_id, interaction_type, rating, date_added
+):
+    repo.record_interaction(
+        user_id=user_id,
+        item_id=item_id,
+        interaction_type=interaction_type,
+        rating=rating,
+        date_added=date_added,
+    )
 
 
-def get_collection(username):
+def get_collection(repo: IngestionRepository, username):
     """Obtiene la colección de discos de un usuario"""
     page = 1
     processed_count = 0
@@ -441,6 +366,7 @@ def get_collection(username):
 
         user_id = user_info["user_id"]
         insert_user(
+            repo,
             user_info["user_id"],
             user_info["username"],
             user_info["location"],
@@ -486,7 +412,7 @@ def get_collection(username):
                         release_id = rls["id"]
 
                         # Verificamos si esta interacción ya existe para evitar duplicados
-                        if interaction_exists(user_id, release_id, "collection"):
+                        if interaction_exists(repo, user_id, release_id, "collection"):
                             page_skipped += 1
                             skipped_count += 1
                             continue
@@ -512,8 +438,9 @@ def get_collection(username):
                         image_url = rls["basic_information"].get("cover_image")
 
                         # Guardar en DB solo con URL cuando el ítem no existe
-                        if not item_exists(release_id):
+                        if not item_exists(repo, release_id):
                             insert_item(
+                                repo,
                                 release_id,
                                 title,
                                 artist,
@@ -525,7 +452,12 @@ def get_collection(username):
 
                         # Insertar interacción con valoración para el sistema de recomendación
                         insert_interaction(
-                            user_id, release_id, "collection", rating, date_added
+                            repo,
+                            user_id,
+                            release_id,
+                            "collection",
+                            rating,
+                            date_added,
                         )
                         page_processed += 1
                         processed_count += 1
@@ -533,7 +465,7 @@ def get_collection(username):
                         print(f"Error procesando release: {rls_err}")
                         continue
 
-                con.commit()
+                repo.commit()
                 print(
                     f"Página {page}: {page_processed} procesados, {page_skipped} saltados."
                 )
@@ -543,7 +475,7 @@ def get_collection(username):
                 page += 1
                 time.sleep(API_PAUSE)  # Usar pausa configurable
 
-            except requests.exceptions.RequestException as e:
+            except Exception as e:
                 print(f"Error de conexión: {e}")
                 break
 
@@ -555,7 +487,7 @@ def get_collection(username):
     )
 
 
-def get_wantlist(username):
+def get_wantlist(repo: IngestionRepository, username):
     """Obtiene la lista de deseos del usuario"""
     page = 1
     processed_count = 0
@@ -573,6 +505,7 @@ def get_wantlist(username):
 
         user_id = user_info["user_id"]
         insert_user(
+            repo,
             user_info["user_id"],
             user_info["username"],
             user_info["location"],
@@ -618,7 +551,7 @@ def get_wantlist(username):
                         release_id = want["id"]
 
                         # Verificamos si esta interacción ya existe
-                        if interaction_exists(user_id, release_id, "wantlist"):
+                        if interaction_exists(repo, user_id, release_id, "wantlist"):
                             page_skipped += 1
                             skipped_count += 1
                             continue
@@ -636,12 +569,13 @@ def get_wantlist(username):
                         )
 
                         # Solo procesamos el ítem si no existe
-                        if not item_exists(release_id):
+                        if not item_exists(repo, release_id):
                             # URL de la imagen
                             image_url = basic_info.get("cover_image")
 
                             # Guardar en DB solo con URL
                             insert_item(
+                                repo,
                                 release_id,
                                 title,
                                 artist,
@@ -653,7 +587,12 @@ def get_wantlist(username):
 
                         # Para wantlist no hay rating, pero mantenemos una interacción especial
                         insert_interaction(
-                            user_id, release_id, "wantlist", None, date_added
+                            repo,
+                            user_id,
+                            release_id,
+                            "wantlist",
+                            None,
+                            date_added,
                         )
                         page_processed += 1
                         processed_count += 1
@@ -661,7 +600,7 @@ def get_wantlist(username):
                         print(f"Error procesando item de wantlist: {want_err}")
                         continue
 
-                con.commit()
+                repo.commit()
                 print(
                     f"Página {page} de wantlist: {page_processed} procesados, {page_skipped} saltados."
                 )
@@ -671,7 +610,7 @@ def get_wantlist(username):
                 page += 1
                 time.sleep(API_PAUSE)  # Usar pausa configurable
 
-            except requests.exceptions.RequestException as e:
+            except Exception as e:
                 print(f"Error de conexión en wantlist: {e}")
                 break
 
@@ -683,7 +622,7 @@ def get_wantlist(username):
     )
 
 
-def get_user_submissions(username, limit=20):
+def get_user_submissions(repo: IngestionRepository, username, limit=20):
     """
     Obtiene contribuciones del usuario a la base de datos de Discogs
     Esto proporciona información valiosa sobre sus conocimientos y preferencias
@@ -721,12 +660,14 @@ def get_user_submissions(username, limit=20):
                     if entity_type == "release" and entity_id:
                         # Verificamos si esta contribución ya existe
                         release_id = int(entity_id)
-                        if interaction_exists(user_id, release_id, "contribution"):
+                        if interaction_exists(
+                            repo, user_id, release_id, "contribution"
+                        ):
                             skipped_count += 1
                             continue
 
                         # Solo si el ítem no existe, obtenemos sus detalles
-                        if not item_exists(release_id):
+                        if not item_exists(repo, release_id):
                             release_url = f"{BASE_URL}/releases/{entity_id}"
                             release_data = safe_api_json(
                                 release_url,
@@ -756,6 +697,7 @@ def get_user_submissions(username, limit=20):
                             image_url = images[0].get("uri") if images else None
 
                             insert_item(
+                                repo,
                                 release_id,
                                 title,
                                 artist,
@@ -771,11 +713,16 @@ def get_user_submissions(username, limit=20):
                         # contribuyó con información sobre este ítem (alta afinidad/conocimiento)
                         date_added = datetime.now().strftime("%Y-%m-%d")
                         insert_interaction(
-                            user_id, release_id, "contribution", None, date_added
+                            repo,
+                            user_id,
+                            release_id,
+                            "contribution",
+                            None,
+                            date_added,
                         )
                         processed_count += 1
 
-                con.commit()
+                repo.commit()
                 print(
                     f"Contribuciones: {processed_count} nuevas, {skipped_count} ya existentes."
                 )
@@ -800,13 +747,20 @@ def safe_api_json(url, params=None, context=""):
         response = api_call(url, params)
         if response and response.status_code == 200:
             return response.json()
-        if response and response.status_code != 200 and context:
-            print(
-                f"No se pudo obtener datos de {context} (status {response.status_code})."
-            )
+        if context:
+            if response is None:
+                message = f"No se recibió respuesta válida al obtener {context}."
+            else:
+                message = f"No se pudo obtener datos de {context} (status {response.status_code})."
+            print(message)
+            logger.warning(message)
     except Exception as exc:
         if context:
             print(f"Error obteniendo datos de {context}: {exc}")
+            logger.exception("Error obteniendo datos de %s", context)
+        else:
+            logger.exception("Error obteniendo datos de %s", url)
+            print(f"Error obteniendo datos de {url}: {exc}")
     return None
 
 
@@ -952,10 +906,10 @@ def discover_users(
 
 
 # Función principal para poblar la base de datos
-def count_user_data(user_id):
+def count_user_data(repo: IngestionRepository, user_id):
     """Cuenta cuántas interacciones tiene un usuario en la base de datos"""
-    cursor.execute("SELECT COUNT(*) FROM interactions WHERE user_id = ?", (user_id,))
-    return cursor.fetchone()[0]
+
+    return repo.count_user_interactions(user_id)
 
 
 def populate_recommendation_system(seed_username="Xmipod", max_users=5):
@@ -965,42 +919,45 @@ def populate_recommendation_system(seed_username="Xmipod", max_users=5):
     # Descubrir usuarios automáticamente
     users = discover_users(seed_username, max_users)
 
-    for username in users:
-        if not username:
-            continue
+    with IngestionRepository(_get_repo_config()) as repo:
+        for username in users:
+            if not username:
+                continue
 
-        # Verificamos si el usuario existe y si tiene datos suficientes
-        user_info = get_user_info(username)
-        if user_info is None:
-            print(f"El usuario {username} no existe en Discogs. Saltando...")
-            continue
+            # Verificamos si el usuario existe y si tiene datos suficientes
+            user_info = get_user_info(username)
+            if user_info is None:
+                print(f"El usuario {username} no existe en Discogs. Saltando...")
+                continue
 
-        user_id = user_info["user_id"]
+            user_id = user_info["user_id"]
 
-        # Si el usuario ya existe y tiene más de 50 interacciones, podemos saltarlo
-        interaction_count = count_user_data(user_id) if user_exists(user_id) else 0
-
-        if user_exists(user_id) and interaction_count > 50:
-            print(
-                f"El usuario {username} ya tiene {interaction_count} interacciones. Saltando..."
+            # Si el usuario ya existe y tiene más de 50 interacciones, podemos saltarlo
+            interaction_count = (
+                count_user_data(repo, user_id) if user_exists(repo, user_id) else 0
             )
-            continue
 
-        print(
-            f"Procesando usuario {username} ({interaction_count} interacciones existentes)"
-        )
+            if user_exists(repo, user_id) and interaction_count > 50:
+                print(
+                    f"El usuario {username} ya tiene {interaction_count} interacciones. Saltando..."
+                )
+                continue
 
-        # Obtener colección de discos
-        get_collection(username)
+            print(
+                f"Procesando usuario {username} ({interaction_count} interacciones existentes)"
+            )
 
-        # Obtener lista de deseos
-        get_wantlist(username)
+            # Obtener colección de discos
+            get_collection(repo, username)
 
-        # Buscar contribuciones (opcional)
-        get_user_submissions(username)
+            # Obtener lista de deseos
+            get_wantlist(repo, username)
 
-        print(f"Datos del usuario {username} procesados completamente.")
-        time.sleep(1)  # Pausa para evitar límites de la API
+            # Buscar contribuciones (opcional)
+            get_user_submissions(repo, username)
+
+            print(f"Datos del usuario {username} procesados completamente.")
+            time.sleep(1)  # Pausa para evitar límites de la API
 
     print("\nBase de datos para recomendaciones generada correctamente.")
 
@@ -1105,135 +1062,126 @@ if __name__ == "__main__":
 
         users = discover_users(seed_username, max_users, extra_seeds=extra_seeds)
 
-        continue_target = None
+        continue_target = args.continue_from.strip() if args.continue_from else None
         continue_processing = True
-        if args.continue_from:
-            continue_target = args.continue_from.strip()
-            if continue_target:
-                discovered_lower = {user.lower(): user for user in users}
-                if continue_target.lower() not in discovered_lower:
-                    print(
-                        f"Advertencia: el usuario '{continue_target}' no fue descubierto en esta corrida; se procesarán todos los usuarios."
-                    )
-                else:
-                    continue_processing = False
-                    print(
-                        f"Continuando desde usuario: {discovered_lower[continue_target.lower()]}"
-                    )
+        discovered_lower: dict[str, str] = {}
+        if continue_target:
+            discovered_lower = {user.lower(): user for user in users}
+            target_lower = continue_target.lower()
+            if target_lower not in discovered_lower:
+                print(
+                    f"Advertencia: el usuario '{continue_target}' no fue descubierto en esta corrida; se procesarán todos los usuarios."
+                )
+            else:
+                continue_processing = False
+                print(f"Continuando desde usuario: {discovered_lower[target_lower]}")
 
         # Contador para mostrar progreso
         processed_count = 0
         total_users = len(users)
 
-        try:
-            for username in users:
-                if not username:
-                    continue
+        with IngestionRepository(_get_repo_config()) as repo:
+            try:
+                for username in users:
+                    if not username:
+                        continue
 
-                # Si estamos en modo continuar y no hemos llegado al usuario deseado, saltamos
-                if not continue_processing:
-                    if username.lower() == continue_target.lower():
-                        continue_processing = True
-                        print(f"Reanudando procesamiento en: {username}")
-                    else:
+                    if not continue_processing:
+                        if (
+                            continue_target
+                            and username.lower() == continue_target.lower()
+                        ):
+                            continue_processing = True
+                            print(f"Reanudando procesamiento en: {username}")
+                        else:
+                            print(
+                                f"Saltando usuario {username} (esperando llegar a {continue_target or ''})"
+                            )
+                            continue
+
+                    processed_count += 1
+                    print(
+                        f"\n[Usuario {processed_count}/{total_users}] Procesando {username}"
+                    )
+
+                    user_info = get_user_info(username)
+                    if user_info is None:
                         print(
-                            f"Saltando usuario {username} (esperando llegar a {continue_target})"
+                            f"El usuario {username} no existe en Discogs. Saltando..."
                         )
                         continue
 
-                processed_count += 1
-                print(
-                    f"\n[Usuario {processed_count}/{total_users}] Procesando {username}"
-                )
+                    user_id = user_info["user_id"]
+                    interaction_count = (
+                        count_user_data(repo, user_id)
+                        if user_exists(repo, user_id)
+                        else 0
+                    )
 
-                # Verificamos si el usuario existe y si tiene datos suficientes
-                user_info = get_user_info(username)
-                if user_info is None:
-                    print(f"El usuario {username} no existe en Discogs. Saltando...")
-                    continue
+                    if (
+                        user_exists(repo, user_id)
+                        and interaction_count >= MIN_ITEMS_THRESHOLD
+                        and not FORCE_UPDATE
+                    ):
+                        print(
+                            f"El usuario {username} ya tiene {interaction_count} interacciones. Saltando..."
+                        )
+                        continue
 
-                user_id = user_info["user_id"]
-
-                # Si el usuario ya existe y tiene suficientes interacciones, podemos saltarlo
-                # a menos que estemos en modo FORCE_UPDATE
-                interaction_count = (
-                    count_user_data(user_id) if user_exists(user_id) else 0
-                )
-
-                if (
-                    user_exists(user_id)
-                    and interaction_count >= MIN_ITEMS_THRESHOLD
-                    and not FORCE_UPDATE
-                ):
                     print(
-                        f"El usuario {username} ya tiene {interaction_count} interacciones. Saltando..."
+                        f"Procesando usuario {username} ({interaction_count} interacciones existentes)"
                     )
-                    continue
 
-                print(
-                    f"Procesando usuario {username} ({interaction_count} interacciones existentes)"
-                )
+                    with open(".last_processed_user.txt", "w") as f:
+                        f.write(username)
 
-                # Guardar el usuario actual en caso de interrupción
-                with open(".last_processed_user.txt", "w") as f:
-                    f.write(username)
+                    get_collection(repo, username)
+                    get_wantlist(repo, username)
+                    get_user_submissions(repo, username)
 
-                # Obtener colección de discos
-                get_collection(username)
+                    print(f"Datos del usuario {username} procesados completamente.")
 
-                # Obtener lista de deseos
-                get_wantlist(username)
-
-                # Buscar contribuciones (opcional)
-                get_user_submissions(username)
-
-                print(f"Datos del usuario {username} procesados completamente.")
-
-                # Mostrar estadísticas de la API
-                print(
-                    "Estadísticas API: {} llamadas totales, {} límites alcanzados".format(
-                        API_CALLS_COUNT,
-                        RATE_LIMIT_HITS,
+                    total_calls, rate_limit_hits = _current_api_stats()
+                    print(
+                        "Estadísticas API: {} llamadas totales, {} límites alcanzados".format(
+                            total_calls,
+                            rate_limit_hits,
+                        )
                     )
-                )
 
-                con.commit()  # Garantizar que todos los datos se guarden después de cada usuario
-                time.sleep(API_PAUSE)  # Pausa entre usuarios
+                    repo.commit()
+                    time.sleep(API_PAUSE)
 
-            # Al terminar exitosamente, borramos el archivo de último usuario procesado
-            if os.path.exists(".last_processed_user.txt"):
-                os.remove(".last_processed_user.txt")
+                if os.path.exists(".last_processed_user.txt"):
+                    os.remove(".last_processed_user.txt")
 
-        except KeyboardInterrupt:
-            print("\n\nProceso interrumpido por el usuario.")
-            print("Para continuar más tarde, ejecuta:")
+            except KeyboardInterrupt:
+                print("\n\nProceso interrumpido por el usuario.")
+                print("Para continuar más tarde, ejecuta:")
 
-            last_user = ""
-            if os.path.exists(".last_processed_user.txt"):
-                with open(".last_processed_user.txt", "r") as f:
-                    last_user = f.read().strip()
+                last_user = ""
+                if os.path.exists(".last_processed_user.txt"):
+                    with open(".last_processed_user.txt", "r") as f:
+                        last_user = f.read().strip()
 
-            if last_user:
-                print(
-                    "python3 {} --seed '{}' --max-users {} --continue-from '{}'".format(
-                        os.path.basename(__file__),
-                        seed_username,
-                        max_users,
-                        last_user,
+                if last_user:
+                    print(
+                        "python3 {} --seed '{}' --max-users {} --continue-from '{}'".format(
+                            os.path.basename(__file__),
+                            seed_username,
+                            max_users,
+                            last_user,
+                        )
                     )
-                )
 
-            # Asegurar que los cambios se guarden antes de salir
-            con.commit()
+                repo.commit()
 
-        except Exception as e:
-            # Manejar cualquier otra excepción
-            print(f"\nError inesperado: {e}")
-            # Asegurar que los cambios se guarden antes de salir
-            con.commit()
-            raise
+            except Exception as e:
+                print(f"\nError inesperado: {e}")
+                repo.commit()
+                raise
 
-        print("\nBase de datos para recomendaciones generada correctamente.")
+            print("\nBase de datos para recomendaciones generada correctamente.")
 
     # Verificar si hay un archivo de último usuario procesado y no se especificó continue-from
     if not args.continue_from and os.path.exists(".last_processed_user.txt"):
@@ -1259,21 +1207,20 @@ if __name__ == "__main__":
     duration = end_time - start_time
 
     # Contar elementos en la base de datos
-    cursor = con.cursor()
-    users_count = cursor.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    items_count = cursor.execute("SELECT COUNT(*) FROM items").fetchone()[0]
-    interactions_count = cursor.execute("SELECT COUNT(*) FROM interactions").fetchone()[
-        0
-    ]
-
-    # Cerrar conexión a la base de datos
-    con.close()
+    with IngestionRepository(_get_repo_config()) as repo:
+        cursor = repo.cursor
+        users_count = cursor.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        items_count = cursor.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        interactions_count = cursor.execute(
+            "SELECT COUNT(*) FROM interactions"
+        ).fetchone()[0]
 
     # Mostrar estadísticas completas
     print("\n==== Estadísticas finales ====")
     print(f"Tiempo total de ejecución: {duration}")
-    print(f"Llamadas a la API realizadas: {API_CALLS_COUNT}")
-    print(f"Límites de tasa alcanzados: {RATE_LIMIT_HITS}")
+    total_calls, rate_limit_hits = _current_api_stats()
+    print(f"Llamadas a la API realizadas: {total_calls}")
+    print(f"Límites de tasa alcanzados: {rate_limit_hits}")
     print(f"Total de usuarios en la base de datos: {users_count}")
     print(f"Total de items en la base de datos: {items_count}")
     print(f"Total de interacciones en la base de datos: {interactions_count}")

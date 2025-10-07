@@ -121,7 +121,7 @@ def main() -> None:
         max_user_pages=max(args.user_pages, 0),
     )
 
-    processed = pipeline.crawl(
+    stats = pipeline.crawl(
         search_url=args.search_url,
         sort=args.sort,
         release_type=args.type,
@@ -129,7 +129,19 @@ def main() -> None:
         release_limit=args.limit,
     )
 
-    logging.info("Scraping completed. Releases ingested: %s", processed)
+    logging.info(
+        "Scraping completed. Releases ingested: %s | new items: %s | new users: %s | new interactions: %s",
+        stats.releases_processed,
+        stats.items_added,
+        stats.users_added,
+        stats.interactions_added,
+    )
+    logging.info(
+        "Database totals -> items: %s | users: %s | interactions: %s",
+        stats.total_items,
+        stats.total_users,
+        stats.total_interactions,
+    )
 
 
 if __name__ == "__main__":
