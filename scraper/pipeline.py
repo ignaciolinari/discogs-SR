@@ -19,6 +19,7 @@ from .db import (
     upsert_item,
     upsert_user,
 )
+from .auth import CookieFileLoader, load_headers_from_file
 from .http import DiscogsScraperSession
 from .models import ReleaseDetail, ReleaseSummary, Review, UserProfile
 from .parsers import (
@@ -26,6 +27,11 @@ from .parsers import (
     parse_release_user_list,
     parse_search_results,
     parse_user_profile,
+)
+from settings import (
+    get_scraper_cookie_refresh,
+    get_scraper_cookies_file,
+    get_scraper_headers_file,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,18 +75,80 @@ class DiscogsScraperPipeline:
         fetch_user_profiles: bool = True,
         fetch_extended_users: bool = True,
         max_user_pages: int = 3,
+        cookies_file: Optional[Path] = None,
+        cookies_refresh_seconds: Optional[float] = None,
+        headers_file: Optional[Path] = None,
+        debug_dump_dir: Optional[Path] = None,
     ) -> None:
         self.db_config = db_config or connection_from_settings()
-        self.session = session or DiscogsScraperSession(
-            min_delay=min_delay,
-            delay_jitter=delay_jitter,
-            max_retries=max_retries,
-            backoff_factor=backoff_factor,
-        )
+        if session is not None:
+            self.session = session
+        else:
+            cookie_loader: CookieFileLoader | None = None
+            cookies_path = cookies_file or get_scraper_cookies_file()
+            if cookies_path:
+                refresh_seconds = (
+                    cookies_refresh_seconds
+                    if cookies_refresh_seconds is not None
+                    else get_scraper_cookie_refresh()
+                )
+                if refresh_seconds is not None and refresh_seconds <= 0:
+                    refresh_seconds = None
+
+                cookie_loader = CookieFileLoader(
+                    path=Path(cookies_path).expanduser(),
+                    reload_interval=refresh_seconds,
+                )
+            else:
+                logger.info(
+                    "Scraping without authenticated cookies; Have/Want user lists "
+                    "may remain empty. Pass --cookies-file or set DISCOGS_COOKIES_FILE "
+                    "to enable authenticated requests."
+                )
+
+            # Check cookie expiration if we have a loader
+            if cookie_loader and not cookie_loader.check_expiration():
+                logger.error(
+                    "=" * 60 + "\n"
+                    "⚠️  COOKIES EXPIRADAS\n"
+                    "=" * 60 + "\n"
+                    "Las cookies de Cloudflare están expiradas.\n"
+                    "El scraper NO podrá obtener usuarios de have/want.\n\n"
+                    "Para actualizar las cookies:\n"
+                    "  python3 refresh_cookies.py\n\n"
+                    "O exporta cookies manualmente desde tu navegador.\n"
+                    "=" * 60
+                )
+
+            extra_headers = None
+            headers_path = headers_file or get_scraper_headers_file()
+            if headers_path:
+                try:
+                    extra_headers = load_headers_from_file(
+                        Path(headers_path).expanduser()
+                    )
+                except Exception as exc:  # pragma: no cover - defensive logging
+                    logger.warning(
+                        "Ignoring headers file %s due to error: %s",
+                        headers_path,
+                        exc,
+                    )
+
+            self.session = DiscogsScraperSession(
+                min_delay=min_delay,
+                delay_jitter=delay_jitter,
+                max_retries=max_retries,
+                backoff_factor=backoff_factor,
+                cookie_loader=cookie_loader,
+                extra_headers=extra_headers,
+            )
         self.fetch_user_profiles = fetch_user_profiles
         self.fetch_extended_users = fetch_extended_users
         self.max_user_pages = max(0, max_user_pages)
         self._known_users: set[str] = set()
+        self._debug_dump_dir = debug_dump_dir.expanduser() if debug_dump_dir else None
+        if self._debug_dump_dir is not None:
+            self._debug_dump_dir.mkdir(parents=True, exist_ok=True)
 
     def crawl(
         self,
@@ -90,6 +158,7 @@ class DiscogsScraperPipeline:
         release_type: str = "release",
         max_pages: int = 5,
         release_limit: Optional[int] = None,
+        commit_every: int = 1,
     ) -> ScrapeStats:
         """Entry point to crawl search results and ingest releases.
 
@@ -99,6 +168,7 @@ class DiscogsScraperPipeline:
             release_type: search type filter.
             max_pages: maximum number of search pages to crawl.
             release_limit: overall release cap (across pages).
+            commit_every: hacer commit cada N releases (default: 1 = después de cada release).
         Returns:
             Summary statistics for the scraping run.
         """
@@ -106,10 +176,23 @@ class DiscogsScraperPipeline:
         processed = 0
         pending_release_ids: set[int] = set()
 
+        # Manejo de interrupciones para hacer commit antes de salir
+        import signal
+
+        def signal_handler(signum, frame):
+            logger.warning("Recibida señal de interrupción. Guardando progreso...")
+            connection.commit()
+            logger.info("Progreso guardado. Releases procesados: %s", processed)
+            raise KeyboardInterrupt()
+
         with get_connection(self.db_config) as connection:
             ensure_schema(connection)
             cursor = connection.cursor()
             start_users, start_items, start_interactions = _get_table_counts(cursor)
+
+            # Registrar handlers para SIGINT (Ctrl+C) y SIGTERM
+            signal.signal(signal.SIGINT, signal_handler)
+            signal.signal(signal.SIGTERM, signal_handler)
 
             for page_number in range(1, max_pages + 1):
                 if release_limit is not None and processed >= release_limit:
@@ -124,9 +207,24 @@ class DiscogsScraperPipeline:
 
                 logger.info("Fetching search page %s", page_number)
                 response = self.session.get(search_url, params=params)
+                logger.debug(
+                    "Search page %s fetched -> status %s | url %s | %s bytes",
+                    page_number,
+                    response.status_code,
+                    response.url,
+                    len(response.text),
+                )
                 summaries = parse_search_results(response.text)
                 if not summaries:
-                    logger.info("No releases detected on search page %s", page_number)
+                    logger.warning(
+                        "No releases detected on search page %s; dumping snapshot if enabled",
+                        page_number,
+                    )
+                    self._dump_debug_html(
+                        kind="search_page",
+                        identifier=str(page_number),
+                        html=response.text,
+                    )
                     break
 
                 for summary in summaries:
@@ -150,6 +248,15 @@ class DiscogsScraperPipeline:
 
                     self._persist_release(cursor, summary, detail)
                     processed += 1
+
+                    # Commit periódico para no perder progreso
+                    if commit_every > 0 and processed % commit_every == 0:
+                        connection.commit()
+                        logger.info(
+                            "Checkpoint: Guardados %s releases hasta ahora (cada %s releases)",
+                            processed,
+                            commit_every,
+                        )
 
             connection.commit()
 
@@ -347,13 +454,19 @@ class DiscogsScraperPipeline:
 
         for page in range(1, self.max_user_pages + 1):
             params = {"page": page, "per_page": 50}
-            url = f"/release/{release_id}/{interaction}"
+            # Discogs usa /release/stats/{id} para mostrar usuarios, no /release/{id}/have o /want
+            url = f"/release/stats/{release_id}"
             try:
+                logger.debug(
+                    "Fetching stats page %s for release %s (looking for %s users)",
+                    page,
+                    release_id,
+                    interaction,
+                )
                 response = self.session.get(url, params=params)
             except RuntimeError as exc:
-                logger.debug(
-                    "Skipping %s page %s for release %s: %s",
-                    interaction,
+                logger.warning(
+                    "Failed to fetch stats page %s for release %s: %s",
                     page,
                     release_id,
                     exc,
@@ -361,23 +474,79 @@ class DiscogsScraperPipeline:
                 break
 
             usernames = parse_release_user_list(response.text)
+            logger.debug(
+                "Found %s usernames on stats page %s for release %s",
+                len(usernames),
+                page,
+                release_id,
+            )
+
             if not usernames:
+                logger.warning(
+                    "No usernames found on %s page %s for release %s; dumping HTML for debugging",
+                    interaction,
+                    page,
+                    release_id,
+                )
+                self._dump_debug_html(
+                    kind=f"{interaction}_page",
+                    identifier=f"{release_id}_{page}",
+                    html=response.text,
+                )
                 break
 
             new_names = [
                 username for username in usernames if username.lower() not in seen
             ]
             if not new_names:
+                logger.debug(
+                    "All usernames on %s page %s for release %s are duplicates; stopping",
+                    interaction,
+                    page,
+                    release_id,
+                )
                 break
 
             seen.update(name.lower() for name in new_names)
             collected.extend(new_names)
+            logger.info(
+                "Collected %s new usernames from %s page %s for release %s (total: %s)",
+                len(new_names),
+                interaction,
+                page,
+                release_id,
+                len(collected),
+            )
 
             if len(new_names) < len(usernames):
                 # Page mostly duplicates; assume no more data
+                logger.debug(
+                    "Page %s has mostly duplicates; stopping %s fetch for release %s",
+                    page,
+                    interaction,
+                    release_id,
+                )
                 break
 
+        logger.info(
+            "Total %s usernames collected for release %s: %s",
+            interaction,
+            release_id,
+            len(collected),
+        )
         return collected
+
+    def _dump_debug_html(self, *, kind: str, identifier: str, html: str) -> None:
+        if self._debug_dump_dir is None:
+            return
+        try:
+            timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            filename = f"{kind}_{identifier}_{timestamp}.html"
+            path = self._debug_dump_dir / filename
+            path.write_text(html, encoding="utf-8")
+            logger.debug("Dumped HTML snapshot to %s", path)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.debug("Failed to dump HTML snapshot: %s", exc)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -442,6 +611,42 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Number of additional user pages to fetch per release.",
     )
     parser.add_argument(
+        "--cookies-file",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a Discogs cookies export (JSON or Netscape) to authenticate "
+            "requests. Defaults to the DISCOGS_COOKIES_FILE environment variable."
+        ),
+    )
+    parser.add_argument(
+        "--cookies-refresh-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Seconds between automatic cookie reloads. Defaults to "
+            "DISCOGS_COOKIES_REFRESH_SECONDS or 900. Set to 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--headers-file",
+        type=Path,
+        default=None,
+        help=(
+            "Optional JSON file with HTTP headers to merge into every request. "
+            "Defaults to the DISCOGS_HEADERS_FILE environment variable."
+        ),
+    )
+    parser.add_argument(
+        "--debug-dump-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory to dump HTML snapshots when parsing fails. Useful for "
+            "debugging layout changes."
+        ),
+    )
+    parser.add_argument(
         "--skip-user-profiles",
         dest="fetch_user_profiles",
         action="store_false",
@@ -490,6 +695,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         fetch_user_profiles=args.fetch_user_profiles,
         fetch_extended_users=args.fetch_extended_users,
         max_user_pages=args.max_user_pages,
+        cookies_file=args.cookies_file,
+        cookies_refresh_seconds=args.cookies_refresh_seconds,
+        headers_file=args.headers_file,
+        debug_dump_dir=args.debug_dump_dir,
     )
 
     stats = pipeline.crawl(

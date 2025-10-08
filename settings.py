@@ -82,4 +82,38 @@ __all__ = [
     "get_discogs_token",
     "get_seed_username",
     "get_api_pause",
+    "get_scraper_cookies_file",
+    "get_scraper_cookie_refresh",
+    "get_scraper_headers_file",
 ]
+
+
+def get_scraper_cookies_file() -> Optional[Path]:
+    """Return the path to a cookies export for web scraping."""
+
+    env_path = os.getenv("DISCOGS_COOKIES_FILE")
+    if not env_path:
+        return None
+    return Path(env_path).expanduser()
+
+
+def get_scraper_cookie_refresh(default: float = 900.0) -> float:
+    """Return refresh interval (seconds) for reloading scraper cookies."""
+
+    env_value = os.getenv("DISCOGS_COOKIES_REFRESH_SECONDS")
+    if not env_value:
+        return default
+    try:
+        refresh = float(env_value)
+        return refresh if refresh > 0 else default
+    except ValueError:
+        return default
+
+
+def get_scraper_headers_file() -> Optional[Path]:
+    """Return an optional JSON file with extra headers for scraping."""
+
+    env_path = os.getenv("DISCOGS_HEADERS_FILE")
+    if not env_path:
+        return None
+    return Path(env_path).expanduser()

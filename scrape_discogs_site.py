@@ -92,10 +92,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Número máximo de páginas extra a consultar para have/want (default: 3).",
     )
     parser.add_argument(
+        "--cookies-file",
+        type=Path,
+        default=None,
+        help=(
+            "Ruta a un export de cookies (JSON o formato Netscape) para "
+            "autenticar el scraper. Por defecto se usa DISCOGS_COOKIES_FILE."
+        ),
+    )
+    parser.add_argument(
+        "--cookies-refresh-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Intervalo en segundos para recargar automáticamente las cookies. "
+            "Por defecto usa DISCOGS_COOKIES_REFRESH_SECONDS o 900. Usa 0 para desactivarlo."
+        ),
+    )
+    parser.add_argument(
+        "--headers-file",
+        type=Path,
+        default=None,
+        help=(
+            "Archivo JSON opcional con headers extra a enviar en cada request. "
+            "Por defecto se usa DISCOGS_HEADERS_FILE."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity (default: INFO).",
+    )
+    parser.add_argument(
+        "--commit-every",
+        type=int,
+        default=1,
+        help="Guardar progreso cada N releases para no perder datos (default: 1).",
     )
     return parser
 
@@ -119,6 +152,9 @@ def main() -> None:
         fetch_user_profiles=args.fetch_profiles,
         fetch_extended_users=args.fetch_extended_users,
         max_user_pages=max(args.user_pages, 0),
+        cookies_file=args.cookies_file,
+        cookies_refresh_seconds=args.cookies_refresh_seconds,
+        headers_file=args.headers_file,
     )
 
     stats = pipeline.crawl(
@@ -127,6 +163,7 @@ def main() -> None:
         release_type=args.type,
         max_pages=max(args.pages, 1),
         release_limit=args.limit,
+        commit_every=args.commit_every,
     )
 
     logging.info(

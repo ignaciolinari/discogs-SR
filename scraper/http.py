@@ -2,18 +2,32 @@
 
 from __future__ import annotations
 
+import logging
 import random
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Mapping, Optional
 from urllib.parse import urljoin
 
 import requests
+
+from .auth import CookieFileLoader
+
+logger = logging.getLogger(__name__)
+
 
 try:  # pragma: no cover - optional dependency
     import cloudscraper  # type: ignore
 except ImportError:  # pragma: no cover - handled gracefully
     cloudscraper = None
+
+try:
+    import certifi
+    import ssl  # noqa: F401
+
+    _CERT_PATH = certifi.where()
+except ImportError:
+    _CERT_PATH = None
 
 BASE_URL = "https://www.discogs.com"
 
@@ -49,24 +63,58 @@ class DiscogsScraperSession:
         backoff_factor: float = 2.0,
         timeout: int = 30,
         user_agent: Optional[str] = None,
+        extra_headers: Optional[Mapping[str, str]] = None,
+        cookies: Optional[Mapping[str, str]] = None,
+        cookie_loader: Optional[CookieFileLoader] = None,
     ) -> None:
         if cloudscraper is not None:
             self._session = cloudscraper.create_scraper()
         else:
             self._session = requests.Session()
+
+        # Configure SSL certificate verification
+        if _CERT_PATH:
+            self._session.verify = _CERT_PATH
+
         self._session.headers.update(
             {
                 "User-Agent": user_agent or random.choice(_DEFAULT_USER_AGENTS),
                 "Accept-Language": "en-US,en;q=0.9,es;q=0.8",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+                "DNT": "1",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Cache-Control": "max-age=0",
             }
         )
+        if extra_headers:
+            self._session.headers.update(
+                {str(k): str(v) for k, v in extra_headers.items()}
+            )
+
         self.min_delay = min_delay
         self.delay_jitter = max(0.0, delay_jitter)
         self.max_retries = max_retries
         self.backoff_factor = backoff_factor
         self.timeout = timeout
         self._last_request_time: float | None = None
+        self._cookie_loader = cookie_loader
+
+        if cookies:
+            self._session.cookies.update(cookies)
+        if self._cookie_loader is not None:
+            try:
+                self._cookie_loader.apply(self._session, force=True)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.warning(
+                    "Failed to bootstrap cookies from %s: %s",
+                    self._cookie_loader.path,
+                    exc,
+                )
 
     def get(self, url: str, *, params: Optional[dict] = None) -> HttpResponse:
         """Fetch a page honoring rate limits and retry policy."""
@@ -75,6 +123,7 @@ class DiscogsScraperSession:
         retries = 0
 
         while True:
+            self._refresh_auth()
             self._respect_delay()
             try:
                 response = self._session.get(
@@ -113,6 +162,14 @@ class DiscogsScraperSession:
             raise RuntimeError(
                 f"Unexpected status {response.status_code} while fetching {absolute_url}"
             )
+
+    def _refresh_auth(self) -> None:
+        if self._cookie_loader is None:
+            return
+        try:
+            self._cookie_loader.apply(self._session)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.debug("Cookie refresh failed: %s", exc)
 
     def _respect_delay(self) -> None:
         if self._last_request_time is None:

@@ -133,3 +133,9 @@ data/
 .last_processed_user.txt
 discogs.db
 sr_discogs/datos/
+.browser_session/
+debug_html/
+docs/
+
+# Cookies de sesión locales
+cookies.json
