@@ -82,6 +82,7 @@ __all__ = [
     "get_discogs_token",
     "get_seed_username",
     "get_api_pause",
+    "get_recommender_config",
     "get_scraper_cookies_file",
     "get_scraper_cookie_refresh",
     "get_scraper_headers_file",
@@ -117,3 +118,30 @@ def get_scraper_headers_file() -> Optional[Path]:
     if not env_path:
         return None
     return Path(env_path).expanduser()
+
+
+def get_recommender_config() -> dict:
+    """Return parámetros configurables del recomendador híbrido.
+
+    Permite ajustar umbrales vía variables de entorno sin editar el código."""
+
+    def _int_env(name: str, default: int) -> int:
+        value = os.getenv(name)
+        if value is None:
+            return default
+        try:
+            parsed = int(value)
+        except ValueError:
+            return default
+        return parsed
+
+    return {
+        "min_rating_pares": _int_env("RECOMMENDER_MIN_RATING_PARES", 4),
+        "min_interacciones_pares": _int_env("RECOMMENDER_MIN_INTERACCIONES_PARES", 2),
+        "min_rating_perfil": _int_env("RECOMMENDER_MIN_RATING_PERFIL", 4),
+        "min_apariciones_perfil": _int_env("RECOMMENDER_MIN_APARICIONES_PERFIL", 2),
+        "umbral_cambio_estrategia": _int_env("RECOMMENDER_UMBRAL_CAMBIO_ESTRATEGIA", 5),
+        "popularity_cache_ttl_seconds": _int_env(
+            "RECOMMENDER_POPULARITY_CACHE_TTL", 3600
+        ),
+    }

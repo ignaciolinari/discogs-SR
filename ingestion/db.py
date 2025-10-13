@@ -136,12 +136,17 @@ class IngestionRepository:
         self,
         *,
         item_id: int,
+        source_release_id: Optional[int] = None,
         title: str,
         artist: str,
         year: Optional[int],
         genres: Sequence[str] | str,
         styles: Sequence[str] | str,
         image_url: Optional[str],
+        country: Optional[str] = None,
+        released: Optional[str] = None,
+        format_summary: Optional[str] = None,
+        label_summary: Optional[str] = None,
     ) -> None:
         if isinstance(genres, str):
             genres_iterable: Sequence[str] = [
@@ -160,12 +165,17 @@ class IngestionRepository:
         scraper_db.upsert_item(
             self.cursor,
             item_id=item_id,
-            title=title,
-            artists=artist,
+            source_release_id=source_release_id or item_id,
+            title=title or "Unknown Title",
+            artists=artist or "Unknown Artist",
             year=year,
             genres=genres_iterable,
             styles=styles_iterable,
             image_url=image_url,
+            country=country,
+            released=released,
+            format_summary=format_summary,
+            label_summary=label_summary,
         )
 
     def record_interaction(

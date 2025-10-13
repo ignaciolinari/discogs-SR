@@ -119,7 +119,7 @@ def check_database():
             print(f"  Ratio interacciones/usuario: {ratio:.1f}")
 
             if ratio > 500:
-                print("  ⚠️  Ratio muy alto - puede haber muchos usuarios sin guardar")
+                print("Ratio alto - puede haber usuarios sin guardar")
 
         # Check interaction types
         cursor.execute(

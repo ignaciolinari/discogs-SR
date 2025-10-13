@@ -36,6 +36,7 @@ class ParserTests(unittest.TestCase):
         detail = parse_release_detail(html)
 
         self.assertEqual(detail.release_id, 12345)
+        self.assertEqual(detail.master_id, 54321)
         self.assertEqual(detail.title, "Album Title")
         self.assertIn("Electronic", detail.genres)
         self.assertIn("House", detail.styles)

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Wrapper inteligente para ejecutar el scraper con verificación automática de cookies.
 
-Este script:
+Este script asume que ya corriste `refresh_cookies_persistent.py` en otra terminal
+para mantener un navegador autenticado y generar cookies frescas. Con eso en mente:
 1. Verifica que las cookies existan y estén válidas
-2. Ofrece actualizar las cookies automáticamente si están expiradas
+2. Si detecta problemas, te guía para volver al script persistente antes de seguir
 3. Ejecuta el scraper con configuración óptima
 """
 
@@ -71,7 +72,7 @@ def check_cookies_status(cookies_file: Path) -> tuple[bool, str]:
             hours_left = (exp_dt - now).total_seconds() / 3600
             if hours_left < 0.5:
                 return (
-                    False,
+                    True,
                     f"⚠️  Cookie de Cloudflare expira en {hours_left * 60:.0f} minutos",
                 )
 
@@ -87,72 +88,48 @@ def check_cookies_status(cookies_file: Path) -> tuple[bool, str]:
 
 
 def refresh_cookies_interactive(cookies_file: Path) -> bool:
-    """Preguntar al usuario si quiere actualizar las cookies."""
+    """Guía para que la persona usuaria refresque las cookies con el script persistente."""
     print()
     print("=" * 60)
     print("ACTUALIZACIÓN DE COOKIES REQUERIDA")
     print("=" * 60)
     print()
     print("Opciones:")
-    print("  1. Actualizar automáticamente con Playwright (recomendado)")
-    print("  2. Actualizar manualmente con extensión de navegador")
-    print("  3. Continuar de todas formas")
-    print("  4. Cancelar")
+    print("  1. Ya corrí refresh_cookies_persistent.py, volver a verificar")
+    print("  2. Continuar de todas formas (no recomendado)")
+    print("  3. Cancelar")
     print()
 
-    choice = input("Selecciona una opción (1-4): ").strip()
+    print("⚠️  Asegurate de ejecutar en otra terminal:")
+    print("    python3 refresh_cookies_persistent.py --output", cookies_file)
+    print(
+        "    (El script mantiene un navegador abierto hasta que confirmes que las cookies están listas)"
+    )
+    print()
+
+    choice = input("Selecciona una opción (1-3): ").strip()
 
     if choice == "1":
-        # Check if playwright is installed
-        try:
-            import playwright  # noqa: F401
-
-            print("\n✓ Playwright está instalado")
-        except ImportError:
-            print("\n❌ Playwright no está instalado")
-            print("\nPara instalar:")
-            print("  pip install playwright")
-            print("  playwright install chromium")
-            print()
-            return False
-
-        # Run refresh script
-        print("\n🚀 Ejecutando actualización automática...")
-        result = subprocess.run(
-            ["python3", "refresh_cookies.py", "--output", str(cookies_file)],
-            cwd=Path.cwd(),
+        input(
+            "Presiona Enter cuando el script persistente haya actualizado las cookies..."
         )
-
-        return result.returncode == 0
-
-    elif choice == "2":
-        print()
-        print("Para actualizar manualmente:")
-        print("1. Instala una extensión de cookies (Cookie-Editor, EditThisCookie)")
-        print("2. Visita https://www.discogs.com e inicia sesión")
-        print("3. Exporta todas las cookies en formato JSON")
-        print(f"4. Guarda el archivo como: {cookies_file}")
-        print()
-        input("Presiona Enter cuando hayas actualizado las cookies...")
 
         # Check again
         valid, msg = check_cookies_status(cookies_file)
-        if valid:
-            print(f"\n✓ {msg}")
-            return True
-        else:
-            print(f"\n{msg}")
-            return False
+        print(f"\n{msg}")
+        return valid
 
-    elif choice == "3":
-        print("\n⚠️  Continuando sin cookies válidas...")
+    elif choice == "2":
+        print()
+        print("⚠️  Continuando sin cookies válidas...")
         print(
-            "El scraper podria no obtener usuarios de have/want si no se actualizan las cookies con otro script."
+            "El scraper podria no obtener usuarios de have/want si no se mantienen las cookies activas."
         )
         return True
 
     else:
         print("\n❌ Operación cancelada")
+        print("Si cambiás de idea, ejecutá primero refresh_cookies_persistent.py.")
         return False
 
 
@@ -160,29 +137,30 @@ def run_scraper(args: argparse.Namespace) -> int:
     """Ejecutar el scraper con los argumentos proporcionados."""
     cmd = [
         "python3",
-        "scrape_discogs_site.py",
+        "-m",
+        "scraper.pipeline",
         "--cookies-file",
         str(args.cookies_file),
-        "--pages",
-        str(args.pages),
-        "--delay",
-        str(args.delay),
+        "--max-pages",
+        str(max(args.pages, 1)),
+        "--min-delay",
+        str(max(args.delay, 0.0)),
         "--delay-jitter",
-        str(args.jitter),
+        str(max(args.jitter, 0.0)),
         "--log-level",
         args.log_level,
         "--commit-every",
-        str(args.commit_every),
+        str(max(args.commit_every, 1)),
     ]
 
     if args.limit:
-        cmd.extend(["--limit", str(args.limit)])
+        cmd.extend(["--release-limit", str(max(args.limit, 1))])
 
     if args.user_pages:
-        cmd.extend(["--user-pages", str(args.user_pages)])
+        cmd.extend(["--max-user-pages", str(max(args.user_pages, 0))])
 
     if not args.fetch_profiles:
-        cmd.append("--no-profile")
+        cmd.append("--skip-user-profiles")
 
     if args.debug:
         cmd.extend(["--debug-dump-dir", "debug_html"])

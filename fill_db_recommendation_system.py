@@ -323,10 +323,20 @@ def insert_user(repo: IngestionRepository, user_id, username, location, joined_d
 
 
 def insert_item(
-    repo: IngestionRepository, item_id, title, artist, year, genre, style, image_url
+    repo: IngestionRepository,
+    item_id,
+    title,
+    artist,
+    year,
+    genre,
+    style,
+    image_url,
+    *,
+    source_release_id=None,
 ):
     repo.upsert_item(
         item_id=item_id,
+        source_release_id=source_release_id or item_id,
         title=title,
         artist=artist,
         year=year,
@@ -410,21 +420,26 @@ def get_collection(repo: IngestionRepository, username):
                 for rls in releases:
                     try:
                         release_id = rls["id"]
+                        basic_info = rls["basic_information"]
+                        master_id = basic_info.get("master_id")
+                        canonical_id = master_id or release_id
 
                         # Verificamos si esta interacción ya existe para evitar duplicados
-                        if interaction_exists(repo, user_id, release_id, "collection"):
+                        if interaction_exists(
+                            repo, user_id, canonical_id, "collection"
+                        ):
                             page_skipped += 1
                             skipped_count += 1
                             continue
 
                         # Si llegamos aquí, es porque necesitamos procesar este disco
-                        title = rls["basic_information"]["title"]
+                        title = basic_info["title"]
                         artist = ", ".join(
-                            [a["name"] for a in rls["basic_information"]["artists"]]
+                            [a["name"] for a in basic_info.get("artists", [])]
                         )
-                        year = rls["basic_information"].get("year")
-                        genres = ", ".join(rls["basic_information"].get("genres", []))
-                        styles = ", ".join(rls["basic_information"].get("styles", []))
+                        year = basic_info.get("year")
+                        genres = ", ".join(basic_info.get("genres", []))
+                        styles = ", ".join(basic_info.get("styles", []))
 
                         # Para el sistema de recomendación, usamos la fecha real cuando está disponible
                         date_added = rls.get(
@@ -435,26 +450,27 @@ def get_collection(repo: IngestionRepository, username):
                         rating = rls.get("rating", None)
 
                         # URL de la imagen (puede no existir)
-                        image_url = rls["basic_information"].get("cover_image")
+                        image_url = basic_info.get("cover_image")
 
                         # Guardar en DB solo con URL cuando el ítem no existe
-                        if not item_exists(repo, release_id):
+                        if not item_exists(repo, canonical_id):
                             insert_item(
                                 repo,
-                                release_id,
+                                canonical_id,
                                 title,
                                 artist,
                                 year,
                                 genres,
                                 styles,
                                 image_url,
+                                source_release_id=release_id,
                             )
 
                         # Insertar interacción con valoración para el sistema de recomendación
                         insert_interaction(
                             repo,
                             user_id,
-                            release_id,
+                            canonical_id,
                             "collection",
                             rating,
                             date_added,
@@ -549,47 +565,43 @@ def get_wantlist(repo: IngestionRepository, username):
                 for want in wants:
                     try:
                         release_id = want["id"]
+                        basic_info = want["basic_information"]
+                        master_id = basic_info.get("master_id")
+                        canonical_id = master_id or release_id
 
-                        # Verificamos si esta interacción ya existe
-                        if interaction_exists(repo, user_id, release_id, "wantlist"):
+                        if interaction_exists(repo, user_id, canonical_id, "wantlist"):
                             page_skipped += 1
                             skipped_count += 1
                             continue
 
-                        basic_info = want["basic_information"]
                         title = basic_info["title"]
                         artist = ", ".join([a["name"] for a in basic_info["artists"]])
                         year = basic_info.get("year")
                         genres = ", ".join(basic_info.get("genres", []))
                         styles = ", ".join(basic_info.get("styles", []))
 
-                        # Usamos la fecha real si está disponible
                         date_added = want.get(
                             "date_added", datetime.now().strftime("%Y-%m-%d")
                         )
 
-                        # Solo procesamos el ítem si no existe
-                        if not item_exists(repo, release_id):
-                            # URL de la imagen
+                        if not item_exists(repo, canonical_id):
                             image_url = basic_info.get("cover_image")
-
-                            # Guardar en DB solo con URL
                             insert_item(
                                 repo,
-                                release_id,
+                                canonical_id,
                                 title,
                                 artist,
                                 year,
                                 genres,
                                 styles,
                                 image_url,
+                                source_release_id=release_id,
                             )
 
-                        # Para wantlist no hay rating, pero mantenemos una interacción especial
                         insert_interaction(
                             repo,
                             user_id,
-                            release_id,
+                            canonical_id,
                             "wantlist",
                             None,
                             date_added,
@@ -623,114 +635,109 @@ def get_wantlist(repo: IngestionRepository, username):
 
 
 def get_user_submissions(repo: IngestionRepository, username, limit=20):
-    """
-    Obtiene contribuciones del usuario a la base de datos de Discogs
-    Esto proporciona información valiosa sobre sus conocimientos y preferencias
-    """
+    """Obtiene contribuciones del usuario y normaliza la interacción al master."""
     print(f"\nBuscando contribuciones del usuario: {username}")
     url = f"{BASE_URL}/users/{username}/contributions"
     params = {"token": DISCOGS_TOKEN, "page": 1, "per_page": limit}
 
     try:
-        r = api_call(url, params)
-        if r and r.status_code == 200:
-            data = r.json()
+        response = api_call(url, params)
+        if response and response.status_code == 200:
+            data = response.json()
             contributions = data.get("contributions", [])
 
-            if contributions:
-                print(f"Procesando {len(contributions)} contribuciones...")
-
-                # Obtenemos la info del usuario una sola vez
-                user_info = get_user_info(username)
-                if user_info is None:
-                    print(
-                        f"No se pudo obtener información del usuario {username}. Saltando contribuciones."
-                    )
-                    return
-
-                user_id = user_info["user_id"]
-                processed_count = 0
-                skipped_count = 0
-
-                # Para cada contribución, podemos registrar el interés del usuario
-                for contrib in contributions:
-                    entity_type = contrib.get("entity_type_name")
-                    entity_id = contrib.get("entity_id")
-
-                    if entity_type == "release" and entity_id:
-                        # Verificamos si esta contribución ya existe
-                        release_id = int(entity_id)
-                        if interaction_exists(
-                            repo, user_id, release_id, "contribution"
-                        ):
-                            skipped_count += 1
-                            continue
-
-                        # Solo si el ítem no existe, obtenemos sus detalles
-                        if not item_exists(repo, release_id):
-                            release_url = f"{BASE_URL}/releases/{entity_id}"
-                            release_data = safe_api_json(
-                                release_url,
-                                params={"token": DISCOGS_TOKEN},
-                                context=f"release {entity_id}",
-                            )
-                            if not release_data:
-                                continue
-
-                            title = release_data.get("title", "Unknown Title")
-                            year = release_data.get("year")
-
-                            artists = release_data.get("artists", [])
-                            artist_names = [
-                                a.get("name", "Unknown Artist") for a in artists
-                            ]
-                            artist = (
-                                ", ".join(artist_names)
-                                if artist_names
-                                else "Unknown Artist"
-                            )
-
-                            genres = ", ".join(release_data.get("genres", []))
-                            styles = ", ".join(release_data.get("styles", []))
-
-                            images = release_data.get("images", [])
-                            image_url = images[0].get("uri") if images else None
-
-                            insert_item(
-                                repo,
-                                release_id,
-                                title,
-                                artist,
-                                year,
-                                genres,
-                                styles,
-                                image_url,
-                            )
-
-                            time.sleep(API_PAUSE)
-
-                        # Guardar una interacción de tipo "contribution" para indicar que el usuario
-                        # contribuyó con información sobre este ítem (alta afinidad/conocimiento)
-                        date_added = datetime.now().strftime("%Y-%m-%d")
-                        insert_interaction(
-                            repo,
-                            user_id,
-                            release_id,
-                            "contribution",
-                            None,
-                            date_added,
-                        )
-                        processed_count += 1
-
-                repo.commit()
-                print(
-                    f"Contribuciones: {processed_count} nuevas, {skipped_count} ya existentes."
-                )
-                return True
-            else:
+            if not contributions:
                 print("No se encontraron contribuciones.")
-    except Exception as e:
-        print(f"Error obteniendo contribuciones: {e}")
+                return False
+
+            print(f"Procesando {len(contributions)} contribuciones...")
+            user_info = get_user_info(username)
+            if user_info is None:
+                print(
+                    f"No se pudo obtener información del usuario {username}. Saltando contribuciones."
+                )
+                return False
+
+            user_id = user_info["user_id"]
+            processed_count = 0
+            skipped_count = 0
+
+            for contrib in contributions:
+                entity_type = contrib.get("entity_type_name")
+                entity_id = contrib.get("entity_id")
+                if entity_type != "release" or not entity_id:
+                    continue
+
+                release_id = int(entity_id)
+                release_data = safe_api_json(
+                    f"{BASE_URL}/releases/{entity_id}",
+                    params={"token": DISCOGS_TOKEN},
+                    context=f"release {entity_id}",
+                )
+                if not release_data:
+                    continue
+
+                master_id = release_data.get("master_id")
+                canonical_id = master_id or release_id
+
+                if interaction_exists(repo, user_id, canonical_id, "contribution"):
+                    skipped_count += 1
+                    continue
+
+                if not item_exists(repo, canonical_id):
+                    title = release_data.get("title", "Unknown Title")
+                    year = release_data.get("year")
+
+                    artists = release_data.get("artists", [])
+                    artist_names = [a.get("name", "Unknown Artist") for a in artists]
+                    artist = (
+                        ", ".join(artist_names) if artist_names else "Unknown Artist"
+                    )
+
+                    genres = ", ".join(release_data.get("genres", []))
+                    styles = ", ".join(release_data.get("styles", []))
+
+                    images = release_data.get("images", [])
+                    image_url = images[0].get("uri") if images else None
+
+                    insert_item(
+                        repo,
+                        canonical_id,
+                        title,
+                        artist,
+                        year,
+                        genres,
+                        styles,
+                        image_url,
+                        source_release_id=release_id,
+                    )
+
+                    time.sleep(API_PAUSE)
+
+                date_added = datetime.now().strftime("%Y-%m-%d")
+                insert_interaction(
+                    repo,
+                    user_id,
+                    canonical_id,
+                    "contribution",
+                    None,
+                    date_added,
+                )
+                processed_count += 1
+
+            repo.commit()
+            print(
+                f"Contribuciones: {processed_count} nuevas, {skipped_count} ya existentes."
+            )
+            return True
+
+        print(
+            "No se pudo obtener contribuciones"
+            if not response
+            else f"No se pudieron obtener contribuciones (status {response.status_code})."
+        )
+    except Exception as exc:
+        print(f"Error obteniendo contribuciones: {exc}")
 
     return False
 
@@ -843,6 +850,8 @@ def discover_users(
     max_users=5,
     depth=DISCOVERY_MAX_DEPTH,
     extra_seeds=None,
+    *,
+    enable_discovery: bool = True,
 ):
     visited = set(load_visited_users())
     result = []
@@ -879,7 +888,41 @@ def discover_users(
                     queue.append((neighbor, level + 1))
             time.sleep(DISCOVERY_PAUSE)
 
-    bfs_from_seed(seed_username)
+    primary_seeds: list[str] = []
+    if seed_username:
+        primary_seeds.append(seed_username.strip())
+    extra_seed_list = [seed for seed in list(extra_queue) if seed]
+
+    if not enable_discovery:
+        for candidate in primary_seeds + extra_seed_list:
+            if not candidate:
+                continue
+            lowered = candidate.lower()
+            if lowered in visited:
+                continue
+            visited.add(lowered)
+            result.append(candidate)
+            if len(result) >= max_users:
+                break
+        if len(result) < max_users:
+            for fallback in POPULAR_USERS:
+                fallback_lower = fallback.lower()
+                if fallback_lower in visited:
+                    continue
+                visited.add(fallback_lower)
+                result.append(fallback)
+                if len(result) >= max_users:
+                    break
+        persist_visited_users(visited)
+        print(f"Usuarios descubiertos: {result}")
+        return result
+
+    for seed_value in primary_seeds:
+        if len(result) >= max_users:
+            break
+        if not seed_value:
+            continue
+        bfs_from_seed(seed_value)
 
     while len(result) < max_users and extra_queue:
         next_seed = extra_queue.popleft()
@@ -1020,6 +1063,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Activar pausa adaptativa basada en el estado del servidor",
     )
+    parser.add_argument(
+        "--disable-discovery",
+        action="store_true",
+        help="Procesar únicamente las seeds provistas sin consultar followers/following",
+    )
 
     args = parser.parse_args()
 
@@ -1050,6 +1098,11 @@ if __name__ == "__main__":
         print("Iniciando población de base de datos para sistema de recomendación...")
         print(f"Modo forzado: {'ACTIVADO' if FORCE_UPDATE else 'DESACTIVADO'}")
         print(f"Pausa entre llamadas API: {API_PAUSE} segundos")
+        print(
+            "Descubrimiento followers/following: {}".format(
+                "DESACTIVADO" if args.disable_discovery else "ACTIVADO"
+            )
+        )
 
         # Descubrir usuarios automáticamente
         extra_seeds = []
@@ -1060,7 +1113,12 @@ if __name__ == "__main__":
                 [seed.strip() for seed in args.seeds_file.read_text().splitlines()]
             )
 
-        users = discover_users(seed_username, max_users, extra_seeds=extra_seeds)
+        users = discover_users(
+            seed_username,
+            max_users,
+            extra_seeds=extra_seeds,
+            enable_discovery=not args.disable_discovery,
+        )
 
         continue_target = args.continue_from.strip() if args.continue_from else None
         continue_processing = True

@@ -48,6 +48,17 @@ def get_recomendaciones():
         recomendar.insertar_interacciones(id_disco, id_usuario, 0)
 
     discos_recomendados = recomendar.datos_discos(id_discos)
+
+    # Filtrar discos sin título o artista válidos
+    discos_recomendados = [
+        disco
+        for disco in discos_recomendados
+        if disco["title"]
+        and disco["title"].strip()
+        and disco["artist"]
+        and disco["artist"].strip()
+    ]
+
     cant_valorados = len(recomendar.items_valorados(id_usuario))
     cant_vistos = len(recomendar.items_vistos(id_usuario))
 
@@ -74,6 +85,17 @@ def get_recomendaciones_disco(id_disco):
         recomendar.insertar_interacciones(id_disco_rec, id_usuario, 0)
 
     discos_recomendados = recomendar.datos_discos(id_discos)
+
+    # Filtrar discos sin título o artista válidos
+    discos_recomendados = [
+        disco
+        for disco in discos_recomendados
+        if disco["title"]
+        and disco["title"].strip()
+        and disco["artist"]
+        and disco["artist"].strip()
+    ]
+
     cant_valorados = len(recomendar.items_valorados(id_usuario))
     cant_vistos = len(recomendar.items_vistos(id_usuario))
 

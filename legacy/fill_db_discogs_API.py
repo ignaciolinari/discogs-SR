@@ -45,6 +45,8 @@ def fetch_collection(repo: IngestionRepository, username: str, delay: float) -> 
 
         for release in releases:
             release_id = release["id"]
+            master_id = release["basic_information"].get("master_id")
+            canonical_id = master_id or release_id
             title = release["basic_information"]["title"]
             artist = ", ".join(
                 [
@@ -66,7 +68,8 @@ def fetch_collection(repo: IngestionRepository, username: str, delay: float) -> 
                 joined_date=None,
             )
             repo.upsert_item(
-                item_id=release_id,
+                item_id=canonical_id,
+                source_release_id=release_id,
                 title=title,
                 artist=artist,
                 year=year,
@@ -75,10 +78,10 @@ def fetch_collection(repo: IngestionRepository, username: str, delay: float) -> 
                 image_url=image_url,
             )
 
-            if not repo.interaction_exists(username, release_id, "collection"):
+            if not repo.interaction_exists(username, canonical_id, "collection"):
                 repo.record_interaction(
                     user_id=username,
-                    item_id=release_id,
+                    item_id=canonical_id,
                     interaction_type="collection",
                     rating=None,
                     date_added=date_added,

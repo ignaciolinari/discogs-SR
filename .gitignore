@@ -136,6 +136,8 @@ sr_discogs/datos/
 .browser_session/
 debug_html/
 docs/
+backups/
+users.txt
 
 # Cookies de sesión locales
 cookies.json

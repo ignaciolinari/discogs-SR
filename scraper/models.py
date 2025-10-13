@@ -9,6 +9,21 @@ from typing import Iterable, List, Optional
 
 
 @dataclass(slots=True)
+class LabelCredit:
+    label_id: Optional[int]
+    name: str
+    catalog_number: Optional[str] = None
+
+
+@dataclass(slots=True)
+class FormatInfo:
+    name: str
+    quantity: Optional[int] = None
+    descriptions: List[str] = field(default_factory=list)
+    notes: Optional[str] = None
+
+
+@dataclass(slots=True)
 class ReleaseSummary:
     release_id: int
     title: str
@@ -35,8 +50,15 @@ class ReleaseDetail:
     title: str
     artists: str
     year: Optional[int]
+    master_id: Optional[int] = None
+    country: Optional[str] = None
+    released: Optional[str] = None
     genres: List[str] = field(default_factory=list)
     styles: List[str] = field(default_factory=list)
+    labels: List[LabelCredit] = field(default_factory=list)
+    label_summary: Optional[str] = None
+    formats: List[FormatInfo] = field(default_factory=list)
+    format_summary: Optional[str] = None
     image_url: Optional[str] = None
     reviews: List[Review] = field(default_factory=list)
     have_users: List[str] = field(default_factory=list)

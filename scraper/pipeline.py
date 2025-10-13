@@ -286,62 +286,69 @@ class DiscogsScraperPipeline:
         detail: ReleaseDetail,
     ) -> None:
         release_id = detail.release_id or summary.release_id
+        canonical_id = detail.master_id or release_id
         upsert_item(
             cursor,
-            item_id=release_id,
+            item_id=canonical_id,
+            source_release_id=release_id,
             title=detail.title or summary.title,
             artists=detail.artists or summary.artists,
             year=detail.year or summary.year,
             genres=detail.genres or [],
             styles=detail.styles or [],
             image_url=detail.image_url,
+            country=detail.country,
+            released=detail.released,
+            format_summary=detail.format_summary,
+            label_summary=detail.label_summary,
         )
 
         # Users who have the release
         for username in detail.have_users:
-            self._record_collection(cursor, username, release_id)
+            self._record_collection(cursor, username, canonical_id)
 
         # Users who want the release
         for username in detail.want_users:
-            self._record_wantlist(cursor, username, release_id)
+            self._record_wantlist(cursor, username, canonical_id)
 
         # Reviews with ratings
         for review in detail.reviews:
             if review.rating is None:
                 continue
-            self._record_review(cursor, review, release_id)
+            self._record_review(cursor, review, canonical_id)
 
         if self.fetch_extended_users and self.max_user_pages:
             self._ingest_extended_users(
                 cursor,
                 release_id,
+                canonical_id,
                 existing_have=set(detail.have_users),
                 existing_want=set(detail.want_users),
             )
 
-    def _record_collection(self, cursor, username: str, release_id: int) -> None:
+    def _record_collection(self, cursor, username: str, canonical_id: int) -> None:
         user = self._ensure_user(cursor, username)
         record_interaction(
             cursor,
             user_id=user.user_id,
-            item_id=release_id,
+            item_id=canonical_id,
             interaction_type="collection",
             rating=None,
             date_added=None,
         )
 
-    def _record_wantlist(self, cursor, username: str, release_id: int) -> None:
+    def _record_wantlist(self, cursor, username: str, canonical_id: int) -> None:
         user = self._ensure_user(cursor, username)
         record_interaction(
             cursor,
             user_id=user.user_id,
-            item_id=release_id,
+            item_id=canonical_id,
             interaction_type="wantlist",
             rating=None,
             date_added=None,
         )
 
-    def _record_review(self, cursor, review: Review, release_id: int) -> None:
+    def _record_review(self, cursor, review: Review, canonical_id: int) -> None:
         user = self._ensure_user(cursor, review.username)
         date_added = (
             review.date.isoformat() if isinstance(review.date, datetime) else None
@@ -349,7 +356,7 @@ class DiscogsScraperPipeline:
         record_interaction(
             cursor,
             user_id=user.user_id,
-            item_id=release_id,
+            item_id=canonical_id,
             interaction_type="rating",
             rating=review.rating,
             date_added=date_added,
@@ -428,6 +435,7 @@ class DiscogsScraperPipeline:
         self,
         cursor,
         release_id: int,
+        canonical_id: int,
         *,
         existing_have: set[str],
         existing_want: set[str],
@@ -437,7 +445,7 @@ class DiscogsScraperPipeline:
             key = username.lower()
             if key in have_lower:
                 continue
-            self._record_collection(cursor, username, release_id)
+            self._record_collection(cursor, username, canonical_id)
             have_lower.add(key)
 
         want_lower = {u.lower() for u in existing_want}
@@ -445,7 +453,7 @@ class DiscogsScraperPipeline:
             key = username.lower()
             if key in want_lower:
                 continue
-            self._record_wantlist(cursor, username, release_id)
+            self._record_wantlist(cursor, username, canonical_id)
             want_lower.add(key)
 
     def _fetch_user_list(self, release_id: int, interaction: str) -> list[str]:
@@ -647,6 +655,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--commit-every",
+        type=int,
+        default=1,
+        help="Persist progress every N releases (default: 1).",
+    )
+    parser.add_argument(
         "--skip-user-profiles",
         dest="fetch_user_profiles",
         action="store_false",
@@ -707,6 +721,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         release_type=args.release_type,
         max_pages=args.max_pages,
         release_limit=args.release_limit,
+        commit_every=max(args.commit_every, 1),
     )
 
     logger.info(
