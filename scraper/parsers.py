@@ -244,7 +244,9 @@ def _parse_reviews(soup: BeautifulSoup) -> List[Review]:
             continue
 
         rating = _extract_rating(node)
-        body_el = node.select_one(".review_body, .content, .body, p")
+        body_el = node.select_one(
+            ".review_body, .content, .body, [class^='markup_'], [class*=' markup_'], p"
+        )
         review_text = body_el.get_text(" ", strip=True) if body_el else ""
 
         date_el = node.select_one("time")
@@ -267,7 +269,9 @@ def _parse_reviews(soup: BeautifulSoup) -> List[Review]:
 
 
 def _extract_rating(node) -> Optional[float]:
-    rating_el = node.select_one("[data-rating], .rating")
+    rating_el = node.select_one(
+        "[data-rating], [data-value], [aria-label*='rated'], [class*='rating']"
+    )
     if rating_el:
         data_rating = rating_el.get("data-rating")
         if data_rating:
@@ -275,9 +279,18 @@ def _extract_rating(node) -> Optional[float]:
             if rating is not None and rating > 5:
                 rating = rating / 100
             return rating
+        data_value = rating_el.get("data-value")
+        if data_value:
+            rating = coerce_float(data_value)
+            if rating is not None and rating > 5:
+                rating = rating / 100
+            return rating
         aria_label = rating_el.get("aria-label")
         if aria_label:
             return coerce_float(_extract_number(aria_label))
+        aria_descendant = rating_el.select_one("[aria-label]")
+        if aria_descendant and aria_descendant.get("aria-label"):
+            return coerce_float(_extract_number(aria_descendant["aria-label"]))
         text_rating = rating_el.get_text(" ", strip=True)
         if text_rating:
             return coerce_float(_extract_number(text_rating))

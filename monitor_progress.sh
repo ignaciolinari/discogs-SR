@@ -9,7 +9,7 @@ while true; do
     echo ""
 
     # Check if scraper is running
-    if pgrep -f "scrape_discogs_site.py" > /dev/null; then
+    if pgrep -f "run_scraper.py" > /dev/null; then
         echo "✓ Scraper está CORRIENDO"
     else
         echo "✗ Scraper NO está corriendo"
