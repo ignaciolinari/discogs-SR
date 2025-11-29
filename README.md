@@ -16,14 +16,12 @@
 - `sr_discogs/`: aplicación Flask usada para validar recomendaciones.
 - `tests/`: parsers, autenticación y lógica del recomendador con fixtures.
 - `legacy/`: scripts antiguos (API + scraper originales) y utilidades heredadas.
-- `docs/`: documentación extendida; arranca por `docs/DETAILED_GUIDE.md` y agrega nuevos apuntes cuando avances.
+- `docs/`: documentación extendida (ver [`DETAILED_GUIDE.md`](docs/DETAILED_GUIDE.md))
 - `settings.py`: configuración compartida (tokens, rutas, pausas).
 
 ## ¿Qué hacer si se retoma?
 
-1. Leer `docs/DETAILED_GUIDE.md` para comprender el flujo completo.
+1. Leer [`docs/DETAILED_GUIDE.md`](docs/DETAILED_GUIDE.md) para comprender el flujo completo.
 2. Regenerar cookies y bases (`scripts/refresh_cookies_persistent.py`, `db/schema.sql`).
 3. Reejecutar los tests (`python -m pytest tests/`) y validar componentes nuevos antes de modificar la lógica del recomendador.
-
-Para detalles históricos y comandos prolongados, recurre a `docs/DETAILED_GUIDE.md`.
 
