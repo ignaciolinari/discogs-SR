@@ -135,7 +135,6 @@ discogs.db
 sr_discogs/datos/
 .browser_session/
 debug_html/
-docs/
 backups/
 users.txt
 
